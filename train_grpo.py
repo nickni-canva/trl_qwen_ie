@@ -28,7 +28,6 @@ from trl import (
     GRPOConfig,
     GRPOTrainer,
     ModelConfig,
-    ScriptArguments,
     TrlParser,
     get_kbit_device_map,
     get_peft_config,
@@ -43,9 +42,9 @@ class ImageEditArgs:
         default="Qwen/Qwen-Image-Edit-2509",
         metadata={"help": "Diffusion model path"}
     )
-    complexity: int = field(
-        default=8,
-        metadata={"help": "Dataset complexity level (1-8)"}
+    complexity: str = field(
+        default="1-8",
+        metadata={"help": "Dataset complexity level(s). Use '1-8' for range, '1,3,5,8' for specific levels, or '8' for single level"}
     )
     image_type: str = field(
         default="real",
@@ -63,7 +62,34 @@ class ImageEditArgs:
 ################
 # Dataset
 ################
-def prepare_dataset(complexity: int, image_type: str, max_samples: int = 1000):
+
+def parse_complexity(complexity_str: str) -> List[int]:
+    """Parse complexity string into list of levels
+    
+    Examples:
+        "1-8" → [1, 2, 3, 4, 5, 6, 7, 8]
+        "1,3,5,8" → [1, 3, 5, 8]
+        "8" → [8]
+    """
+    complexity_str = complexity_str.strip()
+    
+    # Check if it's a range
+    if '-' in complexity_str:
+        parts = complexity_str.split('-')
+        if len(parts) != 2:
+            raise ValueError(f"Invalid complexity range: {complexity_str}")
+        start, end = int(parts[0]), int(parts[1])
+        return list(range(start, end + 1))
+    
+    # Check if it's comma-separated
+    if ',' in complexity_str:
+        return [int(x.strip()) for x in complexity_str.split(',')]
+    
+    # Single value
+    return [int(complexity_str)]
+
+
+def prepare_dataset(complexity: str, image_type: str, max_samples: int = 1000):
     """Load and format Complex-Edit dataset for GRPO
     
     Dataset structure:
@@ -71,10 +97,13 @@ def prepare_dataset(complexity: int, image_type: str, max_samples: int = 1000):
     - 'edit': dict with 'compound' key containing list of compound instructions
     
     We use the compound instructions which combine multiple atomic edits.
-    Complexity parameter selects which level of compound instruction to use (0-7).
+    Complexity parameter can specify multiple levels (e.g., "1-8", "1,3,5,8", or "8").
+    Each image will be expanded to create one sample per complexity level.
     """
     
-    logger.info(f"Loading Complex-Edit (complexity={complexity}, type={image_type})")
+    complexity_levels = parse_complexity(complexity)
+    logger.info(f"Loading Complex-Edit (complexity levels={complexity_levels}, type={image_type})")
+    
     dataset = load_dataset("UCSC-VLAA/Complex-Edit")
     
     # Complex-Edit has splits like 'test_real', 'test_syn'
@@ -86,7 +115,7 @@ def prepare_dataset(complexity: int, image_type: str, max_samples: int = 1000):
     
     logger.info(f"Using split: {split_name}")
     dataset = dataset[split_name]
-    logger.info(f"Dataset size: {len(dataset)} samples")
+    logger.info(f"Original dataset size: {len(dataset)} samples")
     logger.info(f"Dataset columns: {dataset.column_names}")
     
     # Convert to RGB
@@ -99,7 +128,7 @@ def prepare_dataset(complexity: int, image_type: str, max_samples: int = 1000):
     
     dataset = dataset.map(to_rgb)
     
-    # Format for GRPO
+    # Format for GRPO - expand each image to multiple complexity levels
     SYSTEM_PROMPT = (
         "Describe the key features of the input image (color, shape, size, texture, "
         "objects, background), then explain how the user's text instruction should "
@@ -107,31 +136,41 @@ def prepare_dataset(complexity: int, image_type: str, max_samples: int = 1000):
         "requirements while maintaining consistency with the original input where appropriate."
     )
     
-    def format_for_grpo(ex):
-        # Extract compound instruction at the specified complexity level
-        # complexity 1-8 maps to compound indices 0-7
-        compound_idx = min(complexity - 1, len(ex["edit"]["compound"]) - 1)
-        compound_idx = max(0, compound_idx)  # Ensure non-negative
-        
-        instruction = ex["edit"]["compound"][compound_idx]["compound_instruction"]
-        
-        return {
-            "prompt": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": instruction},
-            ],
-            "image": ex["image"],
-            "instruction": instruction,
-        }
+    # Expand dataset: create one sample per (image, complexity_level) pair
+    expanded_samples = []
     
-    dataset = dataset.map(format_for_grpo)
+    for ex in dataset:
+        for complexity_level in complexity_levels:
+            # Extract compound instruction at the specified complexity level
+            # complexity 1-8 maps to compound indices 0-7
+            compound_idx = min(complexity_level - 1, len(ex["edit"]["compound"]) - 1)
+            compound_idx = max(0, compound_idx)  # Ensure non-negative
+            
+            instruction = ex["edit"]["compound"][compound_idx]["compound_instruction"]
+            
+            expanded_samples.append({
+                "prompt": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": instruction},
+                ],
+                "image": ex["image"],
+                "instruction": instruction,
+                "complexity_level": complexity_level,  # Track which level this is
+            })
+    
+    # Convert back to HF dataset
+    from datasets import Dataset
+    dataset = Dataset.from_list(expanded_samples)
+    
+    logger.info(f"Expanded dataset size: {len(dataset)} samples (from {len(dataset) // len(complexity_levels)} images × {len(complexity_levels)} complexity levels)")
     
     # Limit samples
     if len(dataset) > max_samples:
         dataset = dataset.select(range(max_samples))
+        logger.info(f"Limited to {len(dataset)} samples")
     
-    logger.info(f"Dataset ready: {len(dataset)} samples")
-    logger.info(f"Using complexity level {complexity} (compound index {min(complexity-1, 7)})")
+    logger.info(f"Dataset ready: {len(dataset)} total samples")
+    logger.info(f"Complexity levels used: {complexity_levels}")
     
     # Split into train and eval
     if len(dataset) > 100:
@@ -375,7 +414,7 @@ If the instruction contains several atomic operations, evaluate the Instruction 
             # Force flush logs immediately
             import sys
             print("=" * 100, flush=True)
-            print(f"🎯 REWARD FUNCTION CALLED!", flush=True)
+            print("🎯 REWARD FUNCTION CALLED!", flush=True)
             print(f"   Image batch size: {len(image)}", flush=True)
             print(f"   Completions: {len(completions)}", flush=True)
             print("=" * 100, flush=True)
@@ -418,7 +457,7 @@ If the instruction contains several atomic operations, evaluate the Instruction 
             )
             
             # STEP 3: Evaluate with GPT
-            print(f"🔍 STEP 3: Calling GPT evaluator...", flush=True)
+            print("🔍 STEP 3: Calling GPT evaluator...", flush=True)
             logger.info("Evaluating with GPT...")
             evaluator = get_gpt_evaluator()
             print(f"   Evaluator initialized, calling with {len(image)} samples...", flush=True)

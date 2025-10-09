@@ -3,7 +3,7 @@
 # GRPO Training on 8 H200 GPUs - LoRA Fine-Tuning
 # Clean implementation following grpo_vlm.py
 
-export OPENAI_API_KEY="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"
+export OPENAI_API_KEY="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"
 
 accelerate launch \
     --config_file deepspeed_zero2.yaml \
@@ -17,7 +17,7 @@ accelerate launch \
     --per_device_train_batch_size 2 \
     --max_prompt_length 8192 \
     --max_completion_length 1024 \
-    --complexity 8 \
+    --complexity "8" \
     --image_type real \
     --use_vllm \
     --vllm_mode colocate \
@@ -42,4 +42,5 @@ accelerate launch \
     --gradient_checkpointing False
 
 # Effective batch size: 1 × 8 × 2 = 16
+# Complexity levels: 1-8 (all 8 levels, dataset will be 8x larger)
 
