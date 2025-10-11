@@ -33,6 +33,7 @@ from trl import (
     get_peft_config,
     get_quantization_config,
 )
+from trl.rewards import think_format_reward
 
 
 @dataclass
@@ -57,6 +58,7 @@ class ImageEditArgs:
     alignment_weight: float = field(default=0.6)
     quality_weight: float = field(default=0.4)
     n_evals: int = field(default=3)
+    use_think_format_reward: bool = field(default=False)
 
 
 ################
@@ -691,7 +693,7 @@ if __name__ == "__main__":
     trainer = GRPOTrainer(
         model=model_args.model_name_or_path,
         args=training_args,
-        reward_funcs=[reward_fn],  # ✅ Pass during init
+        reward_funcs=[reward_fn] + ([think_format_reward] if img_args.use_think_format_reward else []),  # ✅ Pass during init
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         peft_config=get_peft_config(model_args),
