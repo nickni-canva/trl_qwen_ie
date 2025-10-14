@@ -3,7 +3,7 @@
 # GRPO Training on 8 H200 GPUs - FULL FINE-TUNING (No LoRA)
 # Clean implementation following grpo_vlm.py
 
-export OPENAI_API_KEY="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"
+export OPENAI_API_KEY=
 
 accelerate launch \
     --config_file deepspeed_zero2.yaml \
