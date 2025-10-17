@@ -1,2 +1,4 @@
 outputs/
 wandb/
+backup/
+__pycache__/
