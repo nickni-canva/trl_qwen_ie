@@ -438,34 +438,83 @@ If the instruction contains several atomic operations, evaluate the Instruction 
             # Then drop the system part, keep [user + assistant + completion]
             
             logger.info("Extracting response embeddings from completion text...")
-            response_embeds, response_masks = extract_response_embeddings(
-                vlm_model=vlm_model[0],
-                vlm_processor=vlm_processor,
-                images=image,
-                instructions=instruction,
-                completion_texts=completion_texts,
-            )
+            try:
+                response_embeds, response_masks = extract_response_embeddings(
+                    vlm_model=vlm_model[0],
+                    vlm_processor=vlm_processor,
+                    images=image,
+                    instructions=instruction,
+                    completion_texts=completion_texts,
+                    max_embedding_length=1024,  # Cap to prevent extreme variance
+                )
+            except Exception as e:
+                logger.error(f"Failed to extract embeddings: {e}")
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+                raise
             
             # STEP 2: Generate edited images using these embeddings
             logger.info("Generating edited images...")
             
-            # Call pipeline's internal method to generate with embeddings
-            # We bypass the text generation and use pre-computed embeddings
-            edited_images = generate_with_embeddings(
-                pipe=pipe,
-                images=image,
-                prompt_embeds=response_embeds,
-                prompt_embeds_mask=response_masks,
-            )
+            try:
+                # Call pipeline's internal method to generate with embeddings
+                # We bypass the text generation and use pre-computed embeddings
+                edited_images = generate_with_embeddings(
+                    pipe=pipe,
+                    images=image,
+                    prompt_embeds=response_embeds,
+                    prompt_embeds_mask=response_masks,
+                    max_subbatch_size=8,  # Conservative batch size
+                )
+                
+                # Clean up embeddings immediately after use
+                del response_embeds, response_masks
+                torch.cuda.empty_cache()
+                
+            except torch.cuda.OutOfMemoryError as e:
+                logger.error(f"OOM during image generation: {e}")
+                # Aggressive cleanup and retry with smaller batch
+                response_embeds, response_masks = None, None
+                del response_embeds, response_masks
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+                
+                logger.warning("Retrying with smaller batch size (4)")
+                # Re-extract embeddings (they were deleted)
+                response_embeds, response_masks = extract_response_embeddings(
+                    vlm_model=vlm_model[0],
+                    vlm_processor=vlm_processor,
+                    images=image,
+                    instructions=instruction,
+                    completion_texts=completion_texts,
+                    max_embedding_length=512,  # Even more conservative
+                )
+                
+                edited_images = generate_with_embeddings(
+                    pipe=pipe,
+                    images=image,
+                    prompt_embeds=response_embeds,
+                    prompt_embeds_mask=response_masks,
+                    max_subbatch_size=4,  # Smaller batch
+                )
+                
+                del response_embeds, response_masks
+                torch.cuda.empty_cache()
             
-            # STEP 3: Evaluate with GPT
-            print("🔍 STEP 3: Calling GPT evaluator...", flush=True)
-            logger.info("Evaluating with GPT...")
+            # STEP 3: Evaluate with evaluator
+            print("🔍 STEP 3: Calling evaluator...", flush=True)
+            logger.info("Evaluating...")
             evaluator = get_gpt_evaluator()
             print(f"   Evaluator initialized, calling with {len(image)} samples...", flush=True)
             rewards = evaluator(image, edited_images, instruction)
             
-            print(f"✅ GPT Evaluation complete! Rewards: {rewards}", flush=True)
+            # Final cleanup
+            del edited_images
+            torch.cuda.empty_cache()
+            
+            print(f"✅ Evaluation complete! Rewards: {rewards}", flush=True)
             logger.info(f"Rewards: {rewards}")
             return rewards
             
@@ -473,6 +522,12 @@ If the instruction contains several atomic operations, evaluate the Instruction 
             logger.error(f"Reward computation failed: {e}")
             import traceback
             traceback.print_exc()
+            
+            # Aggressive cleanup on error
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+            
             return [0.5] * len(image)
     
     return reward_fn
@@ -484,6 +539,7 @@ def extract_response_embeddings(
     images,
     instructions,
     completion_texts,
+    max_embedding_length=1024,
 ):
     """
     Extract embeddings from completion text via forward pass (Option C).
@@ -493,6 +549,10 @@ def extract_response_embeddings(
     2. Forward pass to get hidden states
     3. Drop system prompt part
     4. Return embeddings for [user + instruction + assistant + completion]
+    
+    Args:
+        max_embedding_length: Maximum sequence length for embeddings (default 512)
+                            to prevent extreme length variance
     """
     
     # Format prompts with completions
@@ -515,6 +575,11 @@ def extract_response_embeddings(
         )
         full_prompts.append(prompt)
     
+    # Log completion length statistics
+    completion_lengths = [len(c) for c in completion_texts]
+    logger.info(f"📊 Completion lengths: min={min(completion_lengths)}, "
+                f"max={max(completion_lengths)}, mean={sum(completion_lengths)/len(completion_lengths):.1f}")
+    
     # Process with VLM
     inputs = vlm_processor(
         text=full_prompts,
@@ -522,6 +587,9 @@ def extract_response_embeddings(
         padding=True,
         return_tensors="pt",
     ).to(vlm_model.device)
+    
+    logger.info(f"🔍 Input tensor shapes: input_ids={inputs.input_ids.shape}, "
+                f"attention_mask={inputs.attention_mask.shape}")
     
     # Forward pass to get hidden states
     with torch.no_grad():
@@ -534,6 +602,7 @@ def extract_response_embeddings(
         )
     
     hidden_states = outputs.hidden_states[-1]  # Last layer
+    logger.info(f"🔍 Hidden states shape: {hidden_states.shape}")
     
     # Extract masked hidden states
     split_hidden_states = extract_masked_hidden(hidden_states, inputs.attention_mask)
@@ -550,13 +619,22 @@ def extract_response_embeddings(
         drop_idx = num_padding + 64
         
         if drop_idx < len(hidden):
-            processed_hidden_states.append(hidden[drop_idx:])
+            truncated = hidden[drop_idx:]
+            # Cap at max length to prevent extreme variance
+            if len(truncated) > max_embedding_length:
+                logger.warning(f"Sample {i}: Truncating embedding from {len(truncated)} to {max_embedding_length}")
+                truncated = truncated[:max_embedding_length]
+            processed_hidden_states.append(truncated)
         else:
             logger.warning(f"Drop idx {drop_idx} >= length {len(hidden)}, keeping all")
             processed_hidden_states.append(hidden)
     
-    # Pad to max length
-    max_len = max(h.size(0) for h in processed_hidden_states)
+    # Pad to max length (but capped at max_embedding_length)
+    lengths = [h.size(0) for h in processed_hidden_states]
+    max_len = min(max(lengths), max_embedding_length)
+    
+    logger.info(f"📊 Embedding lengths: min={min(lengths)}, max={max(lengths)}, "
+                f"final_max={max_len}, variance={max(lengths)-min(lengths)}")
     
     prompt_embeds = torch.stack([
         torch.cat([h, h.new_zeros(max_len - h.size(0), h.size(1))])
@@ -571,6 +649,14 @@ def extract_response_embeddings(
         for h in processed_hidden_states
     ])
     
+    # Validate output shapes
+    assert prompt_embeds.shape[0] == len(images), \
+        f"Batch size mismatch: embeds={prompt_embeds.shape[0]}, images={len(images)}"
+    assert prompt_embeds.shape[1] == prompt_masks.shape[1], \
+        f"Sequence length mismatch: embeds={prompt_embeds.shape[1]}, masks={prompt_masks.shape[1]}"
+    
+    logger.info(f"✅ Final embeddings shape: {prompt_embeds.shape}, masks shape: {prompt_masks.shape}")
+    
     return prompt_embeds, prompt_masks
 
 
@@ -582,22 +668,97 @@ def extract_masked_hidden(hidden_states, mask):
     return torch.split(selected, valid_lengths.tolist(), dim=0)
 
 
-def generate_with_embeddings(pipe, images, prompt_embeds, prompt_embeds_mask):
-    """Generate images using pre-computed embeddings"""
+def generate_with_embeddings(pipe, images, prompt_embeds, prompt_embeds_mask, max_subbatch_size=8):
+    """
+    Generate images using pre-computed embeddings with sub-batching for memory efficiency.
     
-    # Use pipeline with pre-computed embeddings instead of text prompts
-    # Pipeline accepts either prompt OR prompt_embeds (not both)
-    output = pipe(
-        image=images,
-        prompt=None,  # Must be None when using prompt_embeds
-        negative_prompt=" ",
-        prompt_embeds=prompt_embeds,
-        prompt_embeds_mask=prompt_embeds_mask,
-        num_inference_steps=50,
-        true_cfg_scale=4.0,
-    )
+    Args:
+        pipe: Diffusion pipeline
+        images: Input images
+        prompt_embeds: Pre-computed embeddings [batch_size, seq_len, hidden_dim]
+        prompt_embeds_mask: Attention masks for embeddings
+        max_subbatch_size: Maximum sub-batch size (default 8 for conservative memory usage)
     
-    return output.images
+    Returns:
+        List of generated PIL images
+    """
+    batch_size = len(images)
+    
+    # If batch size is small, process all at once
+    if batch_size <= max_subbatch_size:
+        logger.info(f"Processing batch of {batch_size} in single pass")
+        output = pipe(
+            image=images,
+            prompt=None,  # Must be None when using prompt_embeds
+            negative_prompt=" ",
+            prompt_embeds=prompt_embeds,
+            prompt_embeds_mask=prompt_embeds_mask,
+            num_inference_steps=50,
+            true_cfg_scale=4.0,
+        )
+        return output.images
+    
+    # Process in sub-batches
+    logger.info(f"Large batch ({batch_size}), processing in sub-batches of {max_subbatch_size}")
+    all_images = []
+    
+    for start_idx in range(0, batch_size, max_subbatch_size):
+        end_idx = min(start_idx + max_subbatch_size, batch_size)
+        subbatch_size = end_idx - start_idx
+        
+        logger.info(f"  Processing sub-batch {start_idx//max_subbatch_size + 1}/{(batch_size-1)//max_subbatch_size + 1} "
+                   f"(samples {start_idx}-{end_idx-1})")
+        
+        try:
+            # Extract sub-batch
+            sub_images = images[start_idx:end_idx]
+            sub_embeds = prompt_embeds[start_idx:end_idx]
+            sub_masks = prompt_embeds_mask[start_idx:end_idx]
+            
+            # Generate
+            output = pipe(
+                image=sub_images,
+                prompt=None,
+                negative_prompt=" ",
+                prompt_embeds=sub_embeds,
+                prompt_embeds_mask=sub_masks,
+                num_inference_steps=50,
+                true_cfg_scale=4.0,
+            )
+            
+            all_images.extend(output.images)
+            
+            # Cleanup after each sub-batch
+            del output, sub_embeds, sub_masks
+            torch.cuda.empty_cache()
+            
+        except torch.cuda.OutOfMemoryError as e:
+            logger.error(f"OOM in sub-batch {start_idx}-{end_idx}: {e}")
+            # Try even smaller batch if OOM
+            if subbatch_size > 1:
+                logger.warning(f"Retrying with batch size 1")
+                for idx in range(start_idx, end_idx):
+                    try:
+                        output = pipe(
+                            image=[images[idx]],
+                            prompt=None,
+                            negative_prompt=" ",
+                            prompt_embeds=prompt_embeds[idx:idx+1],
+                            prompt_embeds_mask=prompt_embeds_mask[idx:idx+1],
+                            num_inference_steps=50,
+                            true_cfg_scale=4.0,
+                        )
+                        all_images.extend(output.images)
+                        del output
+                        torch.cuda.empty_cache()
+                    except Exception as e2:
+                        logger.error(f"Failed even with batch size 1 at idx {idx}: {e2}")
+                        raise
+            else:
+                raise
+    
+    logger.info(f"✅ Generated {len(all_images)} images from {batch_size} prompts")
+    return all_images
 
 
 ################

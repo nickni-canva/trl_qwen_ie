@@ -5,14 +5,14 @@
 
 export OPENAI_API_KEY=
 export WANDB_PROJECT=grpo-qwen-image
-export WANDB_NAME=qwen-image-mmmg-readability-curriculum-8steps
+export WANDB_NAME=qwen-image-mmmg-readability-curriculum-8steps-completion-reward
 
 accelerate launch \
     --config_file deepspeed_zero3.yaml \
     train_grpo_qwen_image.py \
     --model_name_or_path Qwen/Qwen2.5-VL-7B-Instruct \
     --gen_model_path Qwen/Qwen-Image \
-    --output_dir outputs/dapo_qwen_image_reason_cl_mmmgscore_8steps \
+    --output_dir outputs/dapo_qwen_image_reason_cl_mmmgscore_8steps_completion_reward \
     --learning_rate 1e-5 \
     --num_train_epochs 3 \
     --max_steps 500 \
@@ -28,7 +28,7 @@ accelerate launch \
     --alignment_weight 0.5 \
     --quality_weight 0.5 \
     --n_evals 3 \
-    --logging_steps 1 \
+    --logging_steps 10 \
     --save_strategy steps \
     --save_steps 50 \
     --save_total_limit 10 \
@@ -48,7 +48,10 @@ accelerate launch \
     --sam2_checkpoint /home/coder/work/MMMG/mmmg_eval/sam2/checkpoints/sam2.1_hiera_large.pt \
     --verbose True \
     --wandb_log_images 8 \
-    --wandb_image_size 512
+    --wandb_image_size 512 \
+    --use_completion_quality_reward \
+    --completion_reward_weight 0.5 \
+    --max_completion_eval_timeout 120
 
 # Effective batch size: 1 × 8 × 2 = 16
 # Dataset: MMMG (all levels and disciplines)

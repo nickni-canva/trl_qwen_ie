@@ -23,61 +23,72 @@ Logging:
 PARALLELIZATION OPTIMIZATIONS (Optimized for 8x H200 GPUs)
 ===============================================================================
 
-This script implements MODERATE parallelization to maximize training throughput
-while avoiding GPU OOM:
+This script implements IN-FLIGHT parallelization to maximize training throughput
+while preventing deadlocks and resource exhaustion:
 
 1. **Multi-GPU Distributed Training** (8 GPUs):
    - ZeRO-3 sharding for memory efficiency
    - Independent batch processing per GPU (16 samples/batch)
    - System-wide: 128 samples processed in parallel per step
 
-2. **Async GPT API Evaluation** (asyncio.gather) - FULLY PARALLEL:
-   - Each GPU: 16 parallel GPT API calls (no restrictions)
-   - System-wide: 8 GPUs × 16 = 128 concurrent API calls
-   - Overlaps API wait time with other GPU computations
+2. **In-Flight Bounded Async Evaluation** (asyncio.as_completed + Semaphore):
+   - Semaphore limits concurrent evaluations (default: 32 per GPU)
+   - Results processed as they complete (pipeline mode)
+   - Graceful degradation: partial failures don't block entire batch
+   - Timeouts prevent infinite hangs: GPT (120s), SAM2 (60s)
+   - System-wide: Up to 8 GPUs × 32 = 256 concurrent evaluations
+
+3. **Async GPT API Evaluation with Timeout**:
+   - Each GPU: Up to 32 parallel GPT API calls (semaphore-bounded)
+   - 120-second timeout prevents stuck requests from blocking batch
+   - Failed requests return default reward (0.0) and log warning
    - No GPU memory impact, fully asynchronous
 
-3. **Serialized GPU SAM2 Processing** - MODERATE PARALLELIZATION:
+4. **Serialized GPU SAM2 Processing with Timeout**:
    - SAM2 runs on GPU (fast) with ThreadPoolExecutor (1 worker) per GPU
    - Only 1 SAM2 at a time per GPU (prevents OOM from memory conflicts)
-   - Thread pool naturally serializes SAM2 calls, avoiding semaphore deadlock
+   - 60-second timeout prevents stuck thread pool tasks
+   - Thread pool naturally serializes SAM2 calls, avoiding deadlock
    - System-wide: 8 GPUs × 1 SAM2 = 8 parallel SAM2 inferences
-   - Within each sample: GPT + SAM2 still run concurrently
-   - Across samples: GPT fully parallel, SAM2 queued
+   - Within each sample: GPT + SAM2 run concurrently with individual timeouts
    - Benefits: Fast GPU inference without OOM, no deadlock risk
-   - Alternative tried: CPU (too slow), parallel GPU (OOM), semaphore (deadlock)
 
-4. **torch.distributed Wandb Gathering**:
+5. **Immediate Synchronous Wandb Gathering**:
+   - gather_object() called directly in reward function (no callback delay)
+   - All ranks participate synchronously (no barrier race conditions)
+   - Eliminates step mismatch issues from dual tracking
    - In-memory data transfer (5-10x faster than file I/O)
-   - No disk bottleneck or cleanup overhead
-   - Efficient cross-GPU synchronization
 
-5. **Dynamic Image Generation Batching**:
+6. **Dynamic Image Generation Batching**:
    - Adaptive batch sizing based on H200's 141GB VRAM
    - Automatically scales batch size to available memory
    - Maximizes GPU utilization without OOM
 
-6. **Memory Optimizations**:
+7. **Memory Optimizations**:
    - SAM2 serialized per GPU (prevents OOM)
    - Aggressive gc.collect() and torch.cuda.empty_cache()
    - Sub-batch processing for large batches
    - LoRA fine-tuning (low memory footprint)
 
-Critical Fixes:
-- Fixed SAM2 torch compile error (Hydra state clearing)
-- Serialized SAM2 with ThreadPoolExecutor (prevents OOM, maintains GPU speed, no deadlock)
-- Wrapped SAM2 init in torch.no_grad() context
+Critical Fixes Applied:
+- ✅ Fixed SAM2 torch compile error (Hydra state clearing)
+- ✅ Added timeouts to all async operations (GPT 120s, SAM2 60s)
+- ✅ Replaced asyncio.gather() with as_completed() + semaphore (in-flight mode)
+- ✅ Removed barrier-based callback (now inline gather_object)
+- ✅ Simplified step tracking (single source of truth)
+- ✅ Graceful degradation for partial failures
 
 Expected Performance:
-- 2x faster wall-clock training time vs sequential evaluation
-- Good balance: GPT fully parallel, SAM2 fast (GPU) without OOM
-- Bottleneck: GPT API latency (30-60s) + serialized SAM2 (32-48s)
+- No deadlocks: Timeouts prevent infinite hangs
+- Better throughput: In-flight processing reduces latency
+- Robust: Partial failures don't block entire batch
+- Good balance: GPT bounded parallel, SAM2 fast on GPU without OOM
 
 System-wide Parallelism Summary:
 - 128 images generated in parallel (8 GPUs × 16/batch)
-- 128 GPT API calls in parallel (fully async, no restrictions)
+- Up to 256 concurrent evaluations (8 GPUs × 32 in-flight limit)
 - 8 SAM2 inferences in parallel (1 per GPU, serialized within GPU)
-- Moderate approach: prevents OOM while maintaining speed
+- In-flight mechanism: Prevents resource exhaustion and deadlocks
 ===============================================================================
 """
 
@@ -152,6 +163,34 @@ class ImageGenArgs:
     wandb_image_size: int = field(
         default=512,
         metadata={"help": "Max image dimension (width/height) for wandb logging. Images are resized to save bandwidth."}
+    )
+    max_gpt_timeout: int = field(
+        default=150,
+        metadata={"help": "Timeout in seconds for GPT API calls (prevents deadlock from stuck requests)"}
+    )
+    max_sam2_timeout: int = field(
+        default=120,
+        metadata={"help": "Timeout in seconds for SAM2 readability evaluation (prevents ThreadPoolExecutor deadlock)"}
+    )
+    max_concurrent_evals: int = field(
+        default=32,
+        metadata={"help": "Maximum concurrent evaluations per GPU (in-flight limit for bounded parallelization)"}
+    )
+    override_max_steps: Optional[int] = field(
+        default=None,
+        metadata={"help": "Override max_steps when resuming training (default: use original max_steps from checkpoint). Use with training_args.resume_from_checkpoint"}
+    )
+    use_completion_quality_reward: bool = field(
+        default=False,
+        metadata={"help": "Enable GPT-5-mini based completion quality evaluation"}
+    )
+    completion_reward_weight: float = field(
+        default=0.5,
+        metadata={"help": "Weight for completion quality reward (MMMG weight = 1 - this value)"}
+    )
+    max_completion_eval_timeout: int = field(
+        default=120,
+        metadata={"help": "Timeout in seconds for completion quality GPT API calls"}
     )
 
 
@@ -325,6 +364,20 @@ class CurriculumDataset:
             self.rng.shuffle(shuffled_indices)
             self.cumulative_indices.append(shuffled_indices)
         
+        # VALIDATION: Check for proper curriculum progression
+        for i in range(len(self.cumulative_indices) - 1):
+            curr_len = len(self.cumulative_indices[i])
+            next_len = len(self.cumulative_indices[i + 1])
+            if next_len <= curr_len:
+                log_with_rank(f"⚠️ WARNING: Curriculum level {i+2} has same or fewer samples than level {i+1} ({next_len} vs {curr_len})", level="warning")
+                log_with_rank(f"   This suggests difficulty groups may not be properly distributed in the dataset!", level="warning")
+        
+        # Check for empty groups
+        for i, group in enumerate(difficulty_groups):
+            if len(self.cumulative_indices[i]) == 0:
+                log_with_rank(f"⚠️ WARNING: Curriculum level {i+1} has 0 samples!", level="warning")
+                log_with_rank(f"   Tuples in this group: {group}", level="warning")
+        
         # Current difficulty level
         self.current_difficulty_level = 0
         self.current_indices = self.cumulative_indices[0]
@@ -333,7 +386,21 @@ class CurriculumDataset:
         log_with_rank(f"   Total difficulty groups: {self.num_groups}")
         for i, group in enumerate(difficulty_groups):
             n_samples = len(self.cumulative_indices[i])
-            log_with_rank(f"   Level {i+1}: {len(group)} tuples, {n_samples} cumulative samples")
+            n_tuples_in_group = len(group)
+            # Show actual tuples present in this difficulty level (not cumulative)
+            if i == 0:
+                new_samples = n_samples
+                new_tuples = n_tuples_in_group
+            else:
+                new_samples = n_samples - len(self.cumulative_indices[i-1])
+                # Count tuples only in current group
+                new_tuples = n_tuples_in_group
+            
+            log_with_rank(f"   Level {i+1}: {new_tuples} new tuples (+{new_samples} new samples), {n_samples} cumulative samples")
+            # Log some example tuples for verification
+            if len(group) > 0:
+                example_tuples = group[:3]  # Show first 3 tuples
+                log_with_rank(f"      Examples: {example_tuples}")
     
     def update_difficulty(self, current_step):
         """
@@ -402,7 +469,7 @@ def parse_list_arg(arg: str, available: List[str]) -> List[str]:
     return [arg]
 
 
-def prepare_dataset(levels: str, disciplines: str, max_samples: int = 1000, local_data_path: str = "/mnt/ephemeral/MMMG_train/train.json"):
+def prepare_dataset(levels: str, disciplines: str, max_samples: int = None, local_data_path: str = "/mnt/ephemeral/MMMG_train/train.json", stratify_by_difficulty: bool = False, difficulty_summary_path: str = None):
     """Load and format MMMG dataset for GRPO from local file
     
     Dataset structure:
@@ -410,6 +477,14 @@ def prepare_dataset(levels: str, disciplines: str, max_samples: int = 1000, loca
     - Each sample has 'question' (prompt), 'key', 'Visual Components' (knowledge graph), 'Key Knowledge' (annotation)
     
     We load all specified level/discipline combinations and format for GRPO.
+    
+    Args:
+        levels: Comma-separated list of education levels or 'all'
+        disciplines: Comma-separated list of disciplines or 'all'
+        max_samples: Maximum number of samples to include in dataset (None = use all samples)
+        local_data_path: Path to the local MMMG train.json file
+        stratify_by_difficulty: If True, ensure proportional representation across difficulty groups
+        difficulty_summary_path: Path to difficulty summary JSON (required if stratify_by_difficulty=True)
     """
     
     levels_list = parse_list_arg(levels, LEVELS_CANONICAL)
@@ -518,24 +593,92 @@ def prepare_dataset(levels: str, disciplines: str, max_samples: int = 1000, loca
     
     log_with_rank(f"Dataset formatted: {len(dataset)} samples")
     
-    # Limit samples
-    if len(dataset) > max_samples:
-        dataset = dataset.select(range(max_samples))
-        log_with_rank(f"Limited to {len(dataset)} samples")
+    # CRITICAL: Shuffle dataset before limiting to ensure diverse level/discipline coverage
+    # This is essential for curriculum learning to work properly
+    import random
+    random.seed(42)  # Fixed seed for reproducibility
+    indices = list(range(len(dataset)))
+    random.shuffle(indices)
+    dataset = dataset.select(indices)
+    log_with_rank(f"Dataset shuffled for diverse curriculum learning")
+    
+    # Limit samples (if max_samples is specified)
+    if max_samples is not None:
+        if stratify_by_difficulty and difficulty_summary_path:
+            # Stratified sampling: ensure proportional representation across difficulty groups
+            log_with_rank(f"Applying stratified sampling by difficulty groups...")
+            
+            # Load difficulty summary
+            difficulty_summary = load_difficulty_summary(difficulty_summary_path)
+            
+            # Build mapping: (level, discipline) -> difficulty_group_index
+            tuple_to_group = {}
+            for group_idx, tuple_item in enumerate(difficulty_summary["tuples"]):
+                key = (tuple_item["level"], tuple_item["discipline"])
+                tuple_to_group[key] = tuple_item["difficulty_rank"] - 1  # 0-indexed
+            
+            # Group dataset indices by difficulty
+            from collections import defaultdict
+            group_to_indices = defaultdict(list)
+            for idx in range(len(dataset)):
+                sample = dataset[idx]
+                key = (sample["level"], sample["discipline"])
+                if key in tuple_to_group:
+                    group_idx = tuple_to_group[key]
+                    group_to_indices[group_idx].append(idx)
+            
+            # Sample proportionally from each group
+            num_groups = len(set(tuple_to_group.values()))
+            samples_per_group = max_samples // num_groups
+            
+            selected_indices = []
+            for group_idx in sorted(group_to_indices.keys()):
+                group_indices = group_to_indices[group_idx]
+                n_to_sample = min(samples_per_group, len(group_indices))
+                selected_indices.extend(random.sample(group_indices, n_to_sample))
+            
+            # If we haven't reached max_samples, add more from largest groups
+            remaining = max_samples - len(selected_indices)
+            if remaining > 0:
+                all_remaining = [idx for idx in range(len(dataset)) if idx not in selected_indices]
+                if len(all_remaining) >= remaining:
+                    selected_indices.extend(random.sample(all_remaining, remaining))
+                else:
+                    selected_indices.extend(all_remaining)
+            
+            dataset = dataset.select(selected_indices[:max_samples])
+            log_with_rank(f"Stratified sampling: selected {len(dataset)} samples across {len(group_to_indices)} difficulty groups")
+        elif len(dataset) > max_samples:
+            dataset = dataset.select(range(max_samples))
+            log_with_rank(f"Limited to {len(dataset)} samples")
+    else:
+        log_with_rank(f"Using full dataset (no sample limit)")
     
     log_with_rank(f"Dataset ready: {len(dataset)} total samples")
     log_with_rank(f"  Levels: {levels_list}")
     log_with_rank(f"  Disciplines: {disciplines_list}")
     
+    # Log dataset distribution for curriculum learning validation
+    from collections import Counter
+    level_dist = Counter([sample["level"] for sample in dataset])
+    discipline_dist = Counter([sample["discipline"] for sample in dataset])
+    combo_dist = Counter([(sample["level"], sample["discipline"]) for sample in dataset])
+    
+    log_with_rank(f"📊 Dataset Distribution:")
+    log_with_rank(f"  Levels: {dict(level_dist)}")
+    log_with_rank(f"  Disciplines: {dict(discipline_dist)}")
+    log_with_rank(f"  Unique (level, discipline) combinations: {len(combo_dist)}")
+    log_with_rank(f"  Top 10 combinations: {dict(combo_dist.most_common(10))}")
+    
     # Split into train and eval
-    if len(dataset) > 100:
-        train_size = len(dataset) - 100
-        train_dataset = dataset.select(range(train_size))
-        eval_dataset = dataset.select(range(train_size, len(dataset)))
-        log_with_rank(f"Split into train: {len(train_dataset)}, eval: {len(eval_dataset)}")
-        return train_dataset, eval_dataset
-    else:
-        return dataset, None
+    # if len(dataset) > 100:
+    #     train_size = len(dataset) - 100
+    #     train_dataset = dataset.select(range(train_size))
+    #     eval_dataset = dataset.select(range(train_size, len(dataset)))
+    #     log_with_rank(f"Split into train: {len(train_dataset)}, eval: {len(eval_dataset)}")
+    #     return train_dataset, eval_dataset
+    # else:
+    return dataset, None
 
 
 ################
@@ -583,6 +726,46 @@ For the output format, please use the following structure:
 ...
 '''
 
+# Completion Quality Evaluation Prompt for GPT-5-mini
+COMPLETION_QUALITY_PROMPT = '''
+Evaluate the following AI-generated image generation prompt for quality.
+
+Original User Request: {original_prompt}
+
+AI-Generated Prompt: {completion}
+
+Rate the AI-generated prompt on a scale of 1-5 based on:
+
+1. **Relevancy** (1-5): How well does it address the original request?
+   - 1: Completely irrelevant or off-topic
+   - 2: Tangentially related but misses key points
+   - 3: Addresses main topic but lacks specifics
+   - 4: Relevant with most key elements covered
+   - 5: Perfectly captures all requirements and intent
+
+2. **Concreteness** (1-5): How specific and detailed is the description?
+   - 1: Extremely vague or abstract
+   - 2: General with minimal details
+   - 3: Moderately specific with some details
+   - 4: Detailed with clear visual descriptions
+   - 5: Highly detailed with precise visual specifications
+
+3. **Language Quality** (1-5): Is the language clear and consistent?
+   - 1: Incoherent or mixed languages inappropriately
+   - 2: Unclear with language mixing issues
+   - 3: Acceptable clarity, minor language issues
+   - 4: Clear and well-structured
+   - 5: Excellent clarity, professional quality
+
+Provide your evaluation in JSON format:
+{{
+  "relevancy_score": <1-5>,
+  "concreteness_score": <1-5>,
+  "language_quality_score": <1-5>,
+  "reasoning": "<brief explanation>"
+}}
+'''
+
 def create_reward_function(
     gen_model_path: str,
     vlm_model,
@@ -603,64 +786,71 @@ def create_reward_function(
     2. Generates images via diffusion
     3. Evaluates with GPT using MMMG knowledge graph evaluation
     
-    PARALLELIZATION OPTIMIZATIONS (for 8x H200 GPUs):
-    ====================================================
+    IN-FLIGHT PARALLELIZATION (for 8x H200 GPUs):
+    ==============================================
     
     1. **Multi-GPU Distributed Evaluation**:
        - 8 GPUs process batches independently in parallel
        - Each GPU: 16 samples/batch → 128 samples system-wide
     
-    2. **Async GPT API Calls** (asyncio.gather):
-       - Within each GPU: 16 parallel API calls (no restrictions)
-       - System-wide: 8 GPUs × 16 = 128 parallel API calls
-       - Fully parallel - GPT has no GPU memory impact
+    2. **In-Flight Bounded Evaluation** (asyncio.as_completed + Semaphore):
+       - Semaphore limits concurrent evaluations (default: 32 per GPU)
+       - Results processed as they complete (pipeline mode)
+       - Graceful degradation: partial failures don't block entire batch
+       - System-wide: Up to 8 GPUs × 32 = 256 concurrent evaluations
     
-    3. **Serialized GPU SAM2 Processing** (MODERATE PARALLELIZATION):
+    3. **Async GPT API Calls with Timeout**:
+       - Each GPU: Up to 32 parallel API calls (semaphore-bounded)
+       - 120-second timeout prevents stuck requests from blocking batch
+       - Failed requests return default reward (0.0) and log warning
+       - System-wide: Up to 256 concurrent GPT API calls
+    
+    4. **Serialized GPU SAM2 Processing with Timeout**:
        - SAM2 runs on GPU (fast) with ThreadPoolExecutor (1 worker) per GPU
-       - Thread pool executor naturally serializes without deadlock risk
+       - 60-second timeout prevents stuck thread pool tasks
        - Only 1 SAM2 at a time per GPU (prevents OOM from memory conflicts)
        - System-wide: 8 GPUs × 1 SAM2 = 8 parallel SAM2 inferences
-       - Within each sample: GPT + SAM2 still run concurrently
-       - Across samples: GPT fully parallel, SAM2 queued
-       - Benefits: Fast GPU inference without OOM, no deadlock
+       - Within each sample: GPT + SAM2 run concurrently with individual timeouts
     
-    4. **torch.distributed Wandb Gathering**:
-       - In-memory data transfer vs file I/O (5-10x faster)
-       - No disk bottleneck, no cleanup overhead
+    5. **Immediate Synchronous Wandb Gathering**:
+       - gather_object() called directly in reward function (no callback delay)
+       - All ranks participate synchronously (no barrier race conditions)
+       - Eliminates step mismatch issues from dual tracking
     
-    5. **Dynamic Image Generation Batching**:
+    6. **Dynamic Image Generation Batching**:
        - Adaptive batch sizing based on H200's 141GB VRAM
        - Maximizes throughput without OOM
     
-    6. **Memory Optimizations**:
+    7. **Memory Optimizations**:
        - SAM2 serialized per GPU (prevents OOM)
        - Aggressive gc.collect() after each phase
        - Sub-batch processing for large batches
     
-    CRITICAL FIXES:
-    ===============
-    - Fixed SAM2 torch compile error by clearing Hydra state
-    - Serialized SAM2 with ThreadPoolExecutor (prevents OOM, maintains GPU speed, no deadlock)
-    - Wrapped SAM2 init in torch.no_grad()
+    CRITICAL FIXES APPLIED:
+    =======================
+    - ✅ Fixed SAM2 torch compile error by clearing Hydra state
+    - ✅ Added timeouts to all async operations (GPT 120s, SAM2 60s)
+    - ✅ Replaced asyncio.gather() with as_completed() + semaphore
+    - ✅ Removed barrier-based callback (now inline gather_object)
+    - ✅ Graceful degradation for partial failures
     
     PARALLELISM SUMMARY:
     ====================
-    - 128 parallel GPT API calls (fully concurrent)
+    - Up to 256 concurrent evaluations (8 GPUs × 32 in-flight limit)
     - 8 parallel SAM2 inferences (1 per GPU, serialized within GPU)
-    - Best of both: GPT fully parallel, SAM2 fast on GPU without OOM
+    - No deadlocks: Timeouts prevent infinite hangs
+    - Better throughput: In-flight processing reduces latency
     
-    EXPECTED SPEEDUP: 2x faster wall-clock training time (vs sequential evaluation)
-    - Bottleneck: GPT API latency (30-60s) + serialized SAM2 (2-3s each × 16 = 32-48s)
-    - Total per batch: ~60-100s (same as semaphore but without deadlock)
+    EXPECTED PERFORMANCE:
+    =====================
+    - No deadlocks: Timeouts prevent infinite hangs from stuck GPT/SAM2
+    - Robust: Partial failures (1-2 samples) don't block entire batch (16 samples)
+    - Good throughput: Semaphore prevents resource exhaustion while maximizing parallelism
     """
     
     # Lazy load
     gen_pipeline = None
     gpt_eval_fn = None
-    
-    # Step counter for custom image logging (separate from trainer's global_step)
-    # This counter increments with each reward function call
-    image_log_step = [0]
     
     def get_pipeline():
         nonlocal gen_pipeline
@@ -1239,7 +1429,195 @@ def create_reward_function(
                     lines.append(f"Edges (0): []")
                 return "\n".join(lines)
             
-            def save_generated_images(images, prompts, completions, keys, rewards, knowledge_fidelities, region_counts, R_scores, gt_graphs, pred_graphs, gt_images, current_step, levels=None, disciplines=None, advantages=None):
+            async def evaluate_completion_quality_async(prompt, completion, timeout=120):
+                """Evaluate completion quality using GPT-5-mini with reasoning"""
+                try:
+                    evaluation_prompt = COMPLETION_QUALITY_PROMPT.format(
+                        original_prompt=prompt,
+                        completion=completion
+                    )
+                    
+                    eval_task = client.responses.create(
+                        model="gpt-5-mini",
+                        input=evaluation_prompt,
+                        reasoning={"effort": "medium"},
+                        text={"verbosity": "low"}
+                    )
+                    
+                    # Wrap with timeout
+                    eval_task_with_timeout = asyncio.wait_for(eval_task, timeout=timeout)
+                    response = await eval_task_with_timeout
+                    
+                    # Parse JSON response
+                    result = json.loads(response.output_text)
+                    
+                    # Compute overall score as average of three scores, then normalize from 1-5 to 0-1
+                    avg_score = (result["relevancy_score"] + result["concreteness_score"] + result["language_quality_score"]) / 3.0
+                    normalized_score = (avg_score - 1.0) / 4.0
+                    
+                    return {
+                        'score': normalized_score,
+                        'details': result,
+                        'success': True
+                    }
+                    
+                except asyncio.TimeoutError:
+                    log_with_rank(f"Completion quality evaluation timeout", level="warning")
+                    return {'score': 0.0, 'details': None, 'success': False}
+                except Exception as e:
+                    log_with_rank(f"Completion quality evaluation error: {e}", level="warning")
+                    return {'score': 0.0, 'details': None, 'success': False}
+            
+            def _log_to_wandb_inline(all_ranks_data, step, training_args):
+                """Log gathered data to wandb (rank 0 only, called inline)"""
+                try:
+                    import wandb
+                    from PIL import Image as PILImage
+                    
+                    if wandb.run is None:
+                        log_with_rank("wandb.run is None, skipping", level="warning", verbose_only=True)
+                        return
+                    
+                    # Define custom step metric for image logging
+                    try:
+                        wandb.define_metric("reward_step")
+                        wandb.define_metric("rank*/generation_table", step_metric="reward_step")
+                        wandb.define_metric("rank*/avg_*", step_metric="reward_step")
+                        wandb.define_metric("rank*/reward_*", step_metric="reward_step")
+                        wandb.define_metric("rank*/num_*", step_metric="reward_step")
+                    except Exception:
+                        pass
+                    
+                    log_with_rank("Processing gathered data from all ranks...", verbose_only=True)
+                    
+                    # Filter valid data (handle both list and dict items from gather_object)
+                    valid_ranks_data = []
+                    for i, data in enumerate(all_ranks_data):
+                        # Skip None and invalid data
+                        if data is None:
+                            log_with_rank(f"Item {i} is None", verbose_only=True)
+                        elif isinstance(data, dict) and data.get("sampled_data") and len(data["sampled_data"]) > 0:
+                            valid_ranks_data.append(data)
+                            log_with_rank(f"Item {i} has {len(data['sampled_data'])} samples", verbose_only=True)
+                        else:
+                            log_with_rank(f"Item {i} has no valid samples", verbose_only=True)
+                    
+                    # Guard: Check if we have any valid data from any rank
+                    if len(valid_ranks_data) == 0:
+                        log_with_rank("No valid samples from any rank, skipping wandb logging", level="warning")
+                        return
+                    
+                    # Create compact wandb table with SAMPLED images
+                    log_with_rank(f"Creating wandb tables for sampled images from {len(valid_ranks_data)} ranks...", verbose_only=True)
+                    
+                    # Comprehensive columns including prompts, completions, and graphs
+                    columns = [
+                        "rank", "idx", "image", "gt_image", 
+                        "prompt", "completion",
+                        "level", "discipline",
+                        "KF", "regions", "R_score", "mmmg_reward",
+                        "completion_score", "completion_json", "final_reward", "advantage",
+                        "gt_graph", "pred_graph"
+                    ]
+                    
+                    table_data = []
+                    for rank_data_item in valid_ranks_data:
+                        r = rank_data_item["rank"]
+                        for sample in rank_data_item["sampled_data"]:
+                            # Convert to wandb.Image (already resized and compressed)
+                            wandb_img = wandb.Image(sample["image"])
+                            if sample["gt_image"] is not None:
+                                wandb_gt_img = wandb.Image(sample["gt_image"])
+                            else:
+                                blank = PILImage.new('RGB', (50, 50), color='gray')
+                                wandb_gt_img = wandb.Image(blank, caption="No GT")
+                            
+                            table_data.append([
+                                r,
+                                sample["idx"],
+                                wandb_img,
+                                wandb_gt_img,
+                                sample["prompt"],
+                                sample["completion"],
+                                sample["level"],
+                                sample["discipline"],
+                                sample["knowledge_fidelity"],
+                                sample["region_count"],
+                                sample["R_score"],
+                                sample["mmmg_reward"],
+                                sample["completion_score"],
+                                json.dumps(sample["completion_details"]) if sample["completion_details"] else "N/A",
+                                sample["reward"],
+                                sample["advantage"],
+                                sample["gt_graph"],
+                                sample["pred_graph"],
+                            ])
+                    
+                    # Single combined table for all ranks
+                    log_with_rank(f"Creating wandb table with {len(table_data)} rows...", verbose_only=True)
+                    table = wandb.Table(columns=columns, data=table_data)
+                    
+                    # Prepare log dict
+                    log_dict = {"reward_step": step}
+                    log_dict["generation_samples"] = table
+                    log_with_rank(f"Prepared log_dict with {len(log_dict)} keys", verbose_only=True)
+                    
+                    # Log summary stats and reward distributions for each rank
+                    for rank_data_item in valid_ranks_data:
+                        r = rank_data_item["rank"]
+                        stats = rank_data_item["summary_stats"]
+                        log_dict[f"rank{r}/num_total"] = stats["num_total"]
+                        log_dict[f"rank{r}/num_sampled"] = stats["num_sampled"]
+                        log_dict[f"rank{r}/avg_reward"] = stats["avg_reward"]
+                        log_dict[f"rank{r}/avg_kf"] = stats["avg_knowledge_fidelity"]
+                        log_dict[f"rank{r}/avg_regions"] = stats["avg_region_count"]
+                        log_dict[f"rank{r}/avg_R_score"] = stats["avg_R_score"]
+                        log_dict[f"rank{r}/avg_mmmg_reward"] = stats["avg_mmmg_reward"]
+                        log_dict[f"rank{r}/avg_completion_score"] = stats["avg_completion_score"]
+                        log_dict[f"rank{r}/reward_std"] = stats["reward_std"]
+                        
+                        # Create distribution histograms for key metrics for this rank
+                        rank_rewards = [sample["reward"] for sample in rank_data_item["sampled_data"]]
+                        rank_kfs = [sample["knowledge_fidelity"] for sample in rank_data_item["sampled_data"]]
+                        rank_regions = [sample["region_count"] for sample in rank_data_item["sampled_data"]]
+                        rank_rscores = [sample["R_score"] for sample in rank_data_item["sampled_data"]]
+                        
+                        if len(rank_rewards) > 0:
+                            log_dict[f"rank{r}/reward_distribution"] = wandb.Histogram(rank_rewards)
+                            log_dict[f"rank{r}/kf_distribution"] = wandb.Histogram(rank_kfs)
+                            log_dict[f"rank{r}/regions_distribution"] = wandb.Histogram(rank_regions)
+                            log_dict[f"rank{r}/rscore_distribution"] = wandb.Histogram(rank_rscores)
+                            log_with_rank(f"   Rank {r}: distributions with {len(rank_rewards)} samples", verbose_only=True)
+                    
+                    # Create combined metric distributions across all ranks
+                    all_rewards = []
+                    all_kfs = []
+                    all_regions = []
+                    all_rscores = []
+                    for rank_data_item in valid_ranks_data:
+                        all_rewards.extend([sample["reward"] for sample in rank_data_item["sampled_data"]])
+                        all_kfs.extend([sample["knowledge_fidelity"] for sample in rank_data_item["sampled_data"]])
+                        all_regions.extend([sample["region_count"] for sample in rank_data_item["sampled_data"]])
+                        all_rscores.extend([sample["R_score"] for sample in rank_data_item["sampled_data"]])
+                    
+                    if len(all_rewards) > 0:
+                        log_dict["all_ranks/reward_distribution"] = wandb.Histogram(all_rewards)
+                        log_dict["all_ranks/kf_distribution"] = wandb.Histogram(all_kfs)
+                        log_dict["all_ranks/regions_distribution"] = wandb.Histogram(all_regions)
+                        log_dict["all_ranks/rscore_distribution"] = wandb.Histogram(all_rscores)
+                        log_with_rank(f"   Combined distributions with {len(all_rewards)} total samples", verbose_only=True)
+                    
+                    # Single log call for all data
+                    wandb.log(log_dict, commit=True)
+                    log_with_rank(f"✅ Successfully logged {len(table_data)} samples to wandb table 'generation_samples' at step {step}")
+                    log_with_rank(f"   Logged data from {len(valid_ranks_data)} ranks", verbose_only=True)
+                
+                except Exception as e:
+                    log_with_rank(f"Failed to log to wandb: {e}", level="error")
+                    import traceback
+                    traceback.print_exc()
+            
+            def save_generated_images(images, prompts, completions, keys, rewards, knowledge_fidelities, region_counts, R_scores, gt_graphs, pred_graphs, gt_images, current_step, mmmg_rewards=None, completion_scores=None, completion_details=None, levels=None, disciplines=None, advantages=None):
                 """Save generated images with metadata and log to wandb (synchronous, following TRL pattern)"""
                 import json
                 from datetime import datetime
@@ -1248,6 +1626,9 @@ def create_reward_function(
                 levels_list = levels if levels else [None] * len(images)
                 disciplines_list = disciplines if disciplines else [None] * len(images)
                 advantages_list = advantages if advantages else [0.0] * len(images)
+                mmmg_rewards_list = mmmg_rewards if mmmg_rewards else rewards  # Default to rewards if not provided
+                completion_scores_list = completion_scores if completion_scores else [0.0] * len(images)
+                completion_details_list = completion_details if completion_details else [None] * len(images)
                 
                 # Get wandb config from training_args
                 wandb_log_images = img_args.wandb_log_images
@@ -1281,10 +1662,10 @@ def create_reward_function(
                 should_log = use_wandb and (training_step % logging_steps == 0)
                 
                 # Save each image with metadata to disk
-                for i, (img, prompt, completion, key, reward, kf, rc, rs, gt_graph, pred_graph, gt_img, level, discipline, advantage) in enumerate(
+                for i, (img, prompt, completion, key, reward, kf, rc, rs, gt_graph, pred_graph, gt_img, level, discipline, advantage, mmmg_reward, comp_score, comp_details) in enumerate(
                     zip(images, prompts, completions, keys or [None]*len(images), 
                         rewards, knowledge_fidelities, region_counts, R_scores, gt_graphs, pred_graphs, gt_images,
-                        levels_list, disciplines_list, advantages_list)
+                        levels_list, disciplines_list, advantages_list, mmmg_rewards_list, completion_scores_list, completion_details_list)
                 ):
                     # Save generated image to disk
                     img_filename = f"image_{i:03d}.png"
@@ -1311,7 +1692,9 @@ def create_reward_function(
                             "knowledge_fidelity": float(kf),
                             "region_count": int(rc),
                             "R_score": float(rs),
-                            "k_score_w": float(reward),
+                            "mmmg_reward": float(mmmg_reward),
+                            "completion_score": float(comp_score),
+                            "completion_details": comp_details,
                             "final_reward": float(reward),
                             "advantage": float(advantage),
                         },
@@ -1381,9 +1764,8 @@ def create_reward_function(
                     selected = sorted_valid[:n_samples] + sorted_valid[-n_samples:]
                     return sorted(selected)  # Sort to maintain order
                 
-                # ========== PREPARE DATA FOR CALLBACK LOGGING (No gather_object here!) ==========
-                # Store data for ImageLoggingCallback to process later in on_step_end()
-                # where all ranks are synchronized by the trainer
+                # ========== IMMEDIATE GATHER FOR WANDB LOGGING (No callback delay) ==========
+                # Gather data synchronously in reward function to avoid callback race conditions
                 if should_log and use_wandb and wandb_log_images > 0:
                     from PIL import Image as PILImage
                     import io
@@ -1404,12 +1786,15 @@ def create_reward_function(
                             # Resize and compress image
                             resized_img = resize_image(images[idx], wandb_image_size)
                             
-                            # Convert to JPEG bytes for faster upload
+                            # FIX: Extract bytes before creating PIL image to avoid dangling buffer references
+                            # This prevents CUDA OOM "1EB allocation" errors from memory corruption during gather_object
                             img_buffer = io.BytesIO()
                             resized_img.convert('RGB').save(img_buffer, format='JPEG', quality=85, optimize=True)
-                            img_buffer.seek(0)
-                            img_pil = PILImage.open(img_buffer)
-                            img_pil.load()  # Force load image data into memory before buffer is closed
+                            img_bytes = img_buffer.getvalue()  # Get bytes before buffer is destroyed
+                            
+                            # Create PIL image from independent bytes copy (not tied to img_buffer lifecycle)
+                            img_pil = PILImage.open(io.BytesIO(img_bytes))
+                            img_pil.load()
                             
                             # Resize GT image if available
                             gt_img_pil = None
@@ -1417,22 +1802,27 @@ def create_reward_function(
                                 resized_gt = resize_image(gt_images[idx], wandb_image_size)
                                 gt_buffer = io.BytesIO()
                                 resized_gt.convert('RGB').save(gt_buffer, format='JPEG', quality=85, optimize=True)
-                                gt_buffer.seek(0)
-                                gt_img_pil = PILImage.open(gt_buffer)
-                                gt_img_pil.load()  # Force load image data into memory before buffer is closed
+                                gt_bytes = gt_buffer.getvalue()  # Get bytes before buffer is destroyed
+                                
+                                # Create PIL image from independent bytes copy
+                                gt_img_pil = PILImage.open(io.BytesIO(gt_bytes))
+                                gt_img_pil.load()
                             
                             sampled_data.append({
                                 "idx": idx,
                                 "image": img_pil,
                                 "gt_image": gt_img_pil,
-                                "prompt": prompts[idx], #[:200] + "..." if len(prompts[idx]) > 200 else prompts[idx],
-                                "completion": completions[idx], #[:200] + "..." if len(completions[idx]) > 200 else completions[idx],
+                                "prompt": prompts[idx],
+                                "completion": completions[idx],
                                 "key": keys[idx] if keys and keys[idx] else "N/A",
                                 "level": levels_list[idx] if levels_list[idx] else "unknown",
                                 "discipline": disciplines_list[idx] if disciplines_list[idx] else "unknown",
                                 "knowledge_fidelity": float(knowledge_fidelities[idx]),
                                 "region_count": int(region_counts[idx]),
                                 "R_score": float(R_scores[idx]),
+                                "mmmg_reward": float(mmmg_rewards_list[idx]),
+                                "completion_score": float(completion_scores_list[idx]),
+                                "completion_details": completion_details_list[idx],
                                 "reward": float(rewards[idx]),
                                 "advantage": float(advantages_list[idx]),
                                 "gt_graph": gt_graphs[idx],
@@ -1450,24 +1840,20 @@ def create_reward_function(
                                 "avg_knowledge_fidelity": float(sum(knowledge_fidelities) / len(knowledge_fidelities)) if len(knowledge_fidelities) > 0 else 0.0,
                                 "avg_region_count": float(sum(region_counts) / len(region_counts)) if len(region_counts) > 0 else 0.0,
                                 "avg_R_score": float(sum(R_scores) / len(R_scores)) if len(R_scores) > 0 else 0.0,
+                                "avg_mmmg_reward": float(sum(mmmg_rewards_list) / len(mmmg_rewards_list)) if len(mmmg_rewards_list) > 0 else 0.0,
+                                "avg_completion_score": float(sum(completion_scores_list) / len(completion_scores_list)) if len(completion_scores_list) > 0 else 0.0,
                                 "reward_std": float(torch.tensor(rewards).std().item()) if len(rewards) > 1 else 0.0,
                             },
                         }
                     
-                    # Store data for callback to process later (NO gather_object here - avoids deadlock!)
-                    # The callback will call gather_object in on_step_end() when ranks are synchronized
-                    if trainer_ref and trainer_ref[0] and hasattr(trainer_ref[0], 'image_logging_callback'):
-                        # DEBUG: Log what step we're storing with and what trainer's step is NOW
-                        current_trainer_step = trainer_ref[0].state.global_step if trainer_ref[0] and hasattr(trainer_ref[0], 'state') else -1
-                        
-                        trainer_ref[0].image_logging_callback.store_data_for_step(training_step, rank_data)
-                        
-                        log_with_rank(f"📦 STORED {len(rank_data['sampled_data']) if rank_data and 'sampled_data' in rank_data else 0} samples")
-                        log_with_rank(f"   Storage key: step={training_step}")
-                        log_with_rank(f"   Trainer global_step NOW: {current_trainer_step}")
-                        log_with_rank(f"   ⚠️ MISMATCH DETECTED!" if training_step != current_trainer_step else f"   ✓ Match confirmed", verbose_only=False if training_step != current_trainer_step else True)
-                    else:
-                        log_with_rank("Warning: image_logging_callback not found on trainer", level="warning", verbose_only=True)
+                    # IMMEDIATE GATHER: All ranks participate synchronously (no callback delay)
+                    log_with_rank(f"📦 Gathering wandb data from all ranks (step={training_step})...", verbose_only=True)
+                    all_ranks_data = gather_object([rank_data] if rank_data else [None])
+                    log_with_rank(f"✅ Gathered data from {len(all_ranks_data)} ranks", verbose_only=True)
+                    
+                    # Only rank 0 logs to wandb
+                    if rank == 0:
+                        _log_to_wandb_inline(all_ranks_data, training_step, training_args)
                 
             
             async def evaluate_single_sample_async(idx, gen_img, kg_str, annotation, user_prompt, gt_img_path, level, discipline):
@@ -1577,17 +1963,67 @@ def create_reward_function(
                     # DEBUG: Log before awaiting gather
                     log_with_rank(f"      ⏳ Sample {idx+1}: AWAITING gather(kg_task, readability_task)...", verbose_only=True)
                     
-                    # Wait for both to complete (GPT parallel, SAM2 serialized per GPU)
+                    # CRITICAL FIX: Wrap BOTH tasks with timeouts to prevent deadlock
+                    # Either GPT or SAM2 can hang indefinitely, blocking the entire batch
                     gather_start_time = time.time()
-                    kg_response, (region_count, R_score) = await asyncio.gather(kg_task, readability_task)
+                    
+                    # Get timeout values from img_args
+                    gpt_timeout = img_args.max_gpt_timeout if img_args else 150
+                    sam2_timeout = img_args.max_sam2_timeout if img_args else 120
+                    
+                    # Wrap both tasks with timeouts
+                    kg_task_with_timeout = asyncio.wait_for(kg_task, timeout=gpt_timeout)
+                    readability_task_with_timeout = asyncio.wait_for(readability_task, timeout=sam2_timeout)
+                    
+                    # Gather with exception handling
+                    results = await asyncio.gather(
+                        kg_task_with_timeout,
+                        readability_task_with_timeout,
+                        return_exceptions=True
+                    )
+                    
                     gather_time = time.time() - gather_start_time
+                    
+                    # Check for timeout/errors in GPT API call
+                    if isinstance(results[0], Exception):
+                        error_type = "timeout" if isinstance(results[0], asyncio.TimeoutError) else "error"
+                        log_with_rank(f"      ❌ Sample {idx+1}: GPT API {error_type}: {results[0]}", level="warning")
+                        
+                        # Decrement counter and return failure
+                        with gpt_active_counter:
+                            gpt_active_count[0] -= 1
+                            current_count = gpt_active_count[0]
+                        log_with_rank(f"      📉 Sample {idx+1}: GPT failed (active: {current_count})", verbose_only=True)
+                        
+                        return {
+                            'reward': 0.0,
+                            'knowledge_fidelity': 0.0,
+                            'region_count': 0,
+                            'R_score': 0.0,
+                            'gt_graph': f"Error: GPT {error_type}",
+                            'pred_graph': f"Error: GPT {error_type}",
+                            'gt_image': gt_img,
+                            'success': False
+                        }
+                    
+                    # Check for timeout/errors in SAM2 readability call
+                    if isinstance(results[1], Exception):
+                        error_type = "timeout" if isinstance(results[1], asyncio.TimeoutError) else "error"
+                        log_with_rank(f"      ⚠️ Sample {idx+1}: SAM2 {error_type}: {results[1]}, using default R_score=0.0", level="warning")
+                        # Can still compute reward with GPT results and default R_score
+                        kg_response = results[0]
+                        region_count, R_score = 0, 0.0
+                    else:
+                        # Both succeeded
+                        kg_response = results[0]
+                        region_count, R_score = results[1]
                     
                     # DEBUG: Log after gather completes with timing breakdown
                     total_sample_time = time.time() - sample_start_time
                     log_with_rank(f"      ✅ Sample {idx+1}: GATHER COMPLETE at {datetime.now().strftime('%d/%m/%y %H:%M:%S')}", verbose_only=True)
                     log_with_rank(f"      ⏱️ Sample {idx+1} timing: submit={gpt_submit_time+sam2_submit_time:.3f}s, gather={gather_time:.2f}s, total={total_sample_time:.2f}s", verbose_only=True)
                     
-                    # DEBUG: Decrement active GPT counter
+                    # DEBUG: Decrement active GPT counter (only if GPT succeeded)
                     with gpt_active_counter:
                         gpt_active_count[0] -= 1
                         current_count = gpt_active_count[0]
@@ -1678,19 +2114,26 @@ def create_reward_function(
                         'success': False
                     }
             
-            async def evaluate_batch_async(generated_images, knowledge_graphs, annotations, batch_step, prompts=None, completions=None, keys=None, gt_img_paths=None, levels=None, disciplines=None):
-                """Evaluate using MMMG protocol with MODERATE parallelization
+            async def evaluate_batch_async(generated_images, knowledge_graphs, annotations, batch_step, prompts=None, completions=None, keys=None, gt_img_paths=None, levels=None, disciplines=None, mmmg_rewards=None, completion_scores=None, completion_details=None):
+                """Evaluate using MMMG protocol with IN-FLIGHT parallelization
                 
-                PARALLELIZATION STRATEGY:
-                - GPT API calls: FULLY PARALLEL (16 concurrent per GPU, 128 system-wide)
-                - SAM2 inference: SERIALIZED per GPU via ThreadPoolExecutor (1 worker, 8 system-wide)
-                - Within each sample: GPT + SAM2 run concurrently
-                - Across samples: GPT fully parallel, SAM2 queued
+                IN-FLIGHT PARALLELIZATION STRATEGY:
+                - Bounded concurrency: Semaphore limits in-flight evaluations (default: 32 per GPU)
+                - Results processed as completed: Pipeline mode reduces latency
+                - Graceful degradation: Partial failures don't block entire batch
+                - Timeouts prevent deadlocks: GPT (120s), SAM2 (60s)
                 
-                This prevents OOM while maintaining speed:
-                - GPT has no GPU memory impact → safe to parallelize fully
-                - SAM2 uses GPU memory → serialize with ThreadPoolExecutor to prevent OOM
-                - Best of both worlds: fast GPU SAM2 without memory conflicts or deadlock
+                Per-Sample Evaluation:
+                - GPT API calls: Async with timeout (120s)
+                - SAM2 inference: ThreadPoolExecutor with timeout (60s)
+                - Both run concurrently within each sample
+                - Either can fail independently without blocking others
+                
+                Benefits:
+                - No deadlocks: Timeouts prevent infinite hangs
+                - Better throughput: as_completed processes results as they arrive
+                - Robust: 1-2 failed samples don't block entire batch of 16
+                - Bounded memory: Semaphore prevents resource exhaustion
                 """
                 import sys
                 import gc
@@ -1705,42 +2148,80 @@ def create_reward_function(
                 disciplines_list = disciplines if disciplines else [None] * len(generated_images)
                 prompts_list = prompts if prompts else ["Generate an educational image"] * len(generated_images)
                 gt_img_paths_list = gt_img_paths if gt_img_paths else [None] * len(generated_images)
+                mmmg_rewards_list = mmmg_rewards if mmmg_rewards else [None] * len(generated_images)
+                completion_scores_list = completion_scores if completion_scores else [0.0] * len(generated_images)
+                completion_details_list = completion_details if completion_details else [None] * len(generated_images)
                 
-                # MODERATE PARALLELIZATION: GPT fully parallel, SAM2 serialized
-                # - GPT: 16 parallel per GPU (fully async, no memory impact)
-                # - SAM2: 1 at a time per GPU (ThreadPoolExecutor-controlled, prevents OOM)
-                # - System-wide: 128 parallel GPT calls, 8 parallel SAM2 inferences
+                # IN-FLIGHT PARALLELIZATION: Bounded concurrency with semaphore
+                # - Limits concurrent evaluations to prevent resource exhaustion
+                # - Processes results as they complete (pipeline mode)
+                # - Gracefully handles partial failures without blocking
                 
-                # Create tasks for evaluation (local to this GPU)
-                log_with_rank(f"🚀 Launching {len(generated_images)} evaluations on this GPU...", verbose_only=True)
-                log_with_rank(f"   GPT: {len(generated_images)} parallel calls (fully concurrent)", verbose_only=True)
-                log_with_rank(f"   SAM2: 1 at a time (serialized via ThreadPoolExecutor)", verbose_only=True)
-                log_with_rank(f"   System-wide: {len(generated_images)} × {dist.get_world_size() if dist.is_initialized() else 1} GPUs", verbose_only=True)
+                # Get max concurrent limit from img_args
+                max_concurrent = img_args.max_concurrent_evals if img_args else 32
+                semaphore = asyncio.Semaphore(max_concurrent)
                 
-                tasks = []
-                for idx, (gen_img, kg_str, annotation) in enumerate(zip(generated_images, knowledge_graphs, annotations)):
-                    # DEBUG: Log task creation
-                    log_with_rank(f"   🎯 Creating async task for sample {idx+1}", verbose_only=True)
-                    
-                    task = evaluate_single_sample_async(
-                        idx=idx,
-                        gen_img=gen_img,
-                        kg_str=kg_str,
-                        annotation=annotation,
-                        user_prompt=prompts_list[idx],
-                        gt_img_path=gt_img_paths_list[idx],
-                        level=levels_list[idx],
-                        discipline=disciplines_list[idx]
-                    )
-                    
-                    # DEBUG: Log task created
-                    log_with_rank(f"   ✓ Task created for sample {idx+1}", verbose_only=True)
-                    tasks.append(task)
+                log_with_rank(f"🚀 Launching {len(generated_images)} evaluations with in-flight limit={max_concurrent}...", verbose_only=True)
+                log_with_rank(f"   GPT timeout: {img_args.max_gpt_timeout if img_args else 120}s", verbose_only=True)
+                log_with_rank(f"   SAM2 timeout: {img_args.max_sam2_timeout if img_args else 60}s", verbose_only=True)
+                log_with_rank(f"   System-wide GPUs: {dist.get_world_size() if dist.is_initialized() else 1}", verbose_only=True)
                 
-                # Execute all evaluations in parallel (within this GPU)
-                log_with_rank("⏳ Waiting for all parallel evaluations to complete on this GPU...", verbose_only=True)
-                results = await asyncio.gather(*tasks)
-                log_with_rank("✅ All parallel evaluations completed on this GPU!", verbose_only=True)
+                # Wrapper to enforce in-flight limit with semaphore
+                async def bounded_evaluate(idx, gen_img, kg_str, annotation):
+                    async with semaphore:  # Acquire slot (blocks if at limit)
+                        log_with_rank(f"   🎯 Starting evaluation for sample {idx+1} (in-flight)", verbose_only=True)
+                        return await evaluate_single_sample_async(
+                            idx=idx,
+                            gen_img=gen_img,
+                            kg_str=kg_str,
+                            annotation=annotation,
+                            user_prompt=prompts_list[idx],
+                            gt_img_path=gt_img_paths_list[idx],
+                            level=levels_list[idx],
+                            discipline=disciplines_list[idx]
+                        )
+                
+                # Create bounded tasks
+                tasks = [
+                    bounded_evaluate(idx, gen_img, kg_str, annotation)
+                    for idx, (gen_img, kg_str, annotation) in enumerate(zip(generated_images, knowledge_graphs, annotations))
+                ]
+                
+                # Process results as they complete (in-flight mode)
+                log_with_rank(f"⏳ Processing evaluations as they complete (max {max_concurrent} in-flight)...", verbose_only=True)
+                results = []
+                completed_count = 0
+                failed_count = 0
+                
+                for coro in asyncio.as_completed(tasks):
+                    try:
+                        result = await coro
+                        results.append(result)
+                        completed_count += 1
+                        
+                        if not result.get('success', True):
+                            failed_count += 1
+                        
+                        # Log progress every 4 completions
+                        if completed_count % 4 == 0:
+                            log_with_rank(f"   Progress: {completed_count}/{len(tasks)} completed ({failed_count} failed)", verbose_only=True)
+                        
+                    except Exception as e:
+                        log_with_rank(f"   ❌ Sample evaluation raised exception: {e}", level="warning", verbose_only=True)
+                        # Graceful degradation: add default failed result
+                        results.append({
+                            'reward': 0.0,
+                            'knowledge_fidelity': 0.0,
+                            'region_count': 0,
+                            'R_score': 0.0,
+                            'gt_graph': f"Error: {str(e)[:100]}",
+                            'pred_graph': f"Error: {str(e)[:100]}",
+                            'gt_image': None,
+                            'success': False
+                        })
+                        failed_count += 1
+                
+                log_with_rank(f"✅ All evaluations completed! Total: {completed_count}, Failed: {failed_count}", verbose_only=True)
                 
                 # Unpack results
                 rewards = []
@@ -1790,7 +2271,8 @@ def create_reward_function(
                 
                 # Save generated images with metadata
                 if prompts is not None and completions is not None:
-                    # Compute simple advantages (reward - mean)
+                    # rewards here are MMMG rewards (k_score_w)
+                    # Pass them as mmmg_rewards for logging, and as rewards for advantage computation
                     mean_reward = sum(rewards) / len(rewards) if rewards else 0.0
                     advantages = [r - mean_reward for r in rewards]
                     
@@ -1801,6 +2283,9 @@ def create_reward_function(
                         rewards, knowledge_fidelities, region_counts,
                         R_scores, gt_graphs, pred_graphs, gt_images,
                         current_step=batch_step,  # Use batch_step from parent scope
+                        mmmg_rewards=rewards,  # MMMG rewards (same as rewards at this point)
+                        completion_scores=completion_scores_list,
+                        completion_details=completion_details_list,
                         levels=levels_list,
                         disciplines=disciplines_list,
                         advantages=advantages
@@ -1816,17 +2301,21 @@ def create_reward_function(
                 
                 return rewards
             
-            def evaluate_batch(generated_images, knowledge_graphs, annotations, batch_step, prompts=None, completions=None, keys=None, gt_img_paths=None, levels=None, disciplines=None):
+            def evaluate_batch(generated_images, knowledge_graphs, annotations, batch_step, prompts=None, completions=None, keys=None, gt_img_paths=None, levels=None, disciplines=None, mmmg_rewards=None, completion_scores=None, completion_details=None):
                 """Synchronous wrapper for async batch evaluation"""
                 # Run the async function in an event loop
                 return asyncio.run(
                     evaluate_batch_async(
                         generated_images, knowledge_graphs, annotations, batch_step,
-                        prompts, completions, keys, gt_img_paths, levels, disciplines
+                        prompts, completions, keys, gt_img_paths, levels, disciplines,
+                        mmmg_rewards, completion_scores, completion_details
                     )
                 )
             
-            gpt_eval_fn = evaluate_batch
+            gpt_eval_fn = {
+                'mmmg': evaluate_batch,
+                'completion_quality': evaluate_completion_quality_async
+            }
         
         return gpt_eval_fn
     
@@ -1845,30 +2334,22 @@ def create_reward_function(
             List[float] - Reward scores (percentage of correctly visualized elements+dependencies)
         """
         try:
-            # CRITICAL FIX: Capture global_step at batch ENTRY, before any async work
-            # This ensures all ranks use the SAME step number for this batch
-            # even if trainer advances while slow ranks are still computing
             import time
             batch_entry_time = time.time()
             
+            # Get current training step (simplified - no dual tracking)
             if trainer_ref[0] is not None and hasattr(trainer_ref[0], 'state'):
-                batch_step = trainer_ref[0].state.global_step
+                current_step = trainer_ref[0].state.global_step
             else:
-                batch_step = image_log_step[0]
+                current_step = 0
             
             # Force flush logs immediately
             import sys
             log_with_rank("=" * 100, verbose_only=True)
             log_with_rank("🎯 MMMG REWARD FUNCTION CALLED!")
-            log_with_rank(f"   🔢 CAPTURED batch_step: {batch_step} (will use this for storage)")
+            log_with_rank(f"   🔢 Training step: {current_step}")
             log_with_rank(f"   Prompt batch size: {len(prompt_text)}", verbose_only=True)
             log_with_rank(f"   Completions: {len(completions)}", verbose_only=True)
-            
-            # DEBUG: Log trainer step to understand increments
-            if trainer_ref[0] is not None and hasattr(trainer_ref[0], 'state'):
-                log_with_rank(f"   📊 Trainer global_step at entry: {trainer_ref[0].state.global_step}")
-                log_with_rank(f"   📊 Trainer _step (internal): {trainer_ref[0]._step}", verbose_only=True)
-            log_with_rank(f"   📊 Image log step (legacy): {image_log_step[0]}", verbose_only=True)
             
             # Check prompt duplication
             unique_prompts = list(set(prompt_text))
@@ -1933,6 +2414,22 @@ def create_reward_function(
             log_with_rank(f"Completion text sample: {completion_texts[0][:200]}...", verbose_only=True)
             log_with_rank(f"📝 First completion: {completion_texts[0][:100]}...", verbose_only=True)
             
+            # STEP 1.5: Launch completion quality evaluation in parallel (if enabled)
+            completion_quality_tasks = None
+            if img_args.use_completion_quality_reward:
+                log_with_rank("🚀 Launching completion quality evaluation in parallel with image generation...", verbose_only=True)
+                import asyncio
+                
+                evaluator_dict = get_gpt_evaluator()
+                completion_quality_eval_fn = evaluator_dict['completion_quality']
+                
+                # Create tasks for async evaluation (will run in parallel with image generation)
+                completion_quality_tasks = [
+                    completion_quality_eval_fn(prompt_text[i], completion_texts[i], img_args.max_completion_eval_timeout)
+                    for i in range(len(prompt_text))
+                ]
+                log_with_rank(f"   Created {len(completion_quality_tasks)} completion quality tasks", verbose_only=True)
+            
             # Get pipeline
             pipe = get_pipeline()
             
@@ -1963,7 +2460,8 @@ def create_reward_function(
             # STEP 3: Evaluate with MMMG GPT protocol
             log_with_rank("🔍 STEP 3: Calling MMMG GPT evaluator...", verbose_only=True)
             log_with_rank("Evaluating with MMMG protocol...", verbose_only=True)
-            evaluator = get_gpt_evaluator()
+            evaluator_dict = get_gpt_evaluator()
+            evaluator = evaluator_dict['mmmg']
             log_with_rank(f"   Evaluator initialized, calling with {len(prompt_text)} samples...", verbose_only=True)
             
             # Extract keys if available in kwargs
@@ -1978,54 +2476,88 @@ def create_reward_function(
             
             log_with_rank(f"🖼️ GT image paths: {gt_img_paths if gt_img_paths else 'None'}", verbose_only=True)
             
-            # Call evaluator with all metadata for logging
-            rewards = evaluator(
+            # STEP 4: Await completion quality results in parallel (if enabled)
+            completion_scores = None
+            completion_details = None
+            if img_args.use_completion_quality_reward and completion_quality_tasks:
+                log_with_rank("⏳ Awaiting completion quality evaluation (running in parallel)...", verbose_only=True)
+                import asyncio
+                
+                # Run the async tasks
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                completion_results = loop.run_until_complete(asyncio.gather(*completion_quality_tasks))
+                loop.close()
+                
+                completion_scores = [r['score'] for r in completion_results]
+                completion_details = [r['details'] for r in completion_results]
+                
+                log_with_rank(f"✅ Completion quality evaluation complete!", verbose_only=True)
+                log_with_rank(f"   Avg completion score: {sum(completion_scores)/len(completion_scores):.3f}", verbose_only=True)
+            
+            # Call MMMG evaluator with all metadata for logging (including completion scores)
+            mmmg_rewards = evaluator(
                 generated_images, 
                 knowledge_graph, 
                 annotation,
-                batch_step,  # Pass captured batch_step
+                current_step,  # Use current step (simplified)
                 prompts=prompt_text,
                 completions=completion_texts,
                 keys=keys,
                 gt_img_paths=gt_img_paths,
                 levels=levels,
-                disciplines=disciplines
+                disciplines=disciplines,
+                mmmg_rewards=None,  # Not combined yet
+                completion_scores=completion_scores,
+                completion_details=completion_details
             )
             
-            log_with_rank(f"✅ MMMG GPT Evaluation complete! Rewards: {rewards}", verbose_only=True)
-            log_with_rank(f"Rewards: {rewards}", verbose_only=True)
+            log_with_rank(f"✅ MMMG GPT Evaluation complete! Rewards: {mmmg_rewards}", verbose_only=True)
+            
+            # STEP 5: Combine rewards if completion quality is enabled
+            if img_args.use_completion_quality_reward and completion_scores:
+                mmmg_weight = 1.0 - img_args.completion_reward_weight
+                completion_weight = img_args.completion_reward_weight
+                
+                combined_rewards = [
+                    mmmg_weight * mmmg_r + completion_weight * comp_r
+                    for mmmg_r, comp_r in zip(mmmg_rewards, completion_scores)
+                ]
+                
+                log_with_rank(f"🔀 Combined rewards (MMMG: {mmmg_weight:.1f}, Completion: {completion_weight:.1f}):")
+                log_with_rank(f"   MMMG avg: {sum(mmmg_rewards)/len(mmmg_rewards):.3f}")
+                log_with_rank(f"   Completion avg: {sum(completion_scores)/len(completion_scores):.3f}")
+                log_with_rank(f"   Combined avg: {sum(combined_rewards)/len(combined_rewards):.3f}")
+                
+                rewards = combined_rewards
+            else:
+                rewards = mmmg_rewards
+            
+            log_with_rank(f"Final Rewards: {rewards}", verbose_only=True)
             
             # MEMORY OPTIMIZATION: Clear generated images after evaluation
             del generated_images, completion_texts
             gc.collect()
             torch.cuda.empty_cache()
             
-            # Increment image logging step counter
-            image_log_step[0] += 1
-            
-            # DEBUG: Log completion timing and final step state
+            # DEBUG: Log completion timing
             batch_total_time = time.time() - batch_entry_time
-            if trainer_ref[0] is not None and hasattr(trainer_ref[0], 'state'):
-                final_trainer_step = trainer_ref[0].state.global_step
-                log_with_rank(f"⏱️ BATCH COMPLETE in {batch_total_time:.2f}s")
-                log_with_rank(f"   Batch entry step: {batch_step}")
-                log_with_rank(f"   Trainer step NOW: {final_trainer_step}")
-                log_with_rank(f"   ⚠️ STEP ADVANCED during batch!" if final_trainer_step != batch_step else f"   ✓ Step unchanged")
+            log_with_rank(f"⏱️ BATCH COMPLETE in {batch_total_time:.2f}s")
             
             return rewards
             
         except Exception as e:
             log_with_rank(f"Reward computation failed: {e}", level="error")
+            log_with_rank(f"Failed with Prompt:\n{prompt_text}", level="error")
+            log_with_rank(f"Failed with Completion:\n{completions}", level="error")
             import traceback
-            traceback.log_with_rank_exc()
+            traceback.print_exc()
             
             # Clear any partial data
             import gc
             gc.collect()
             torch.cuda.empty_cache()
             
-            # Increment image logging step counter even on error
-            image_log_step[0] += 1
             return [0.5] * len(prompt_text)
     
     return reward_fn
@@ -2273,12 +2805,90 @@ if __name__ == "__main__":
         training_args.model_init_kwargs["device_map"] = get_kbit_device_map()
         training_args.model_init_kwargs["quantization_config"] = quant_config
     
+    # Handle checkpoint resume
+    # IMPORTANT: When using DeepSpeed + PEFT, checkpoints may only contain PEFT adapters
+    # without DeepSpeed optimizer state. We need to load the PEFT adapter manually.
+    resumed_step = 0
+    peft_checkpoint_path = None  # Track PEFT-only checkpoint for manual loading
+    
+    if training_args.resume_from_checkpoint:
+        import json
+        import glob
+        # Convert to absolute path and resolve
+        checkpoint_path = Path(training_args.resume_from_checkpoint).resolve()
+        
+        log_with_rank(f"🔍 Checking checkpoint path: {checkpoint_path}", verbose_only=True)
+        
+        if checkpoint_path.exists():
+            # Check if this is a full DeepSpeed checkpoint or PEFT-only checkpoint
+            deepspeed_checkpoint_dirs = glob.glob(str(checkpoint_path / "global_step*"))
+            has_deepspeed_state = len(deepspeed_checkpoint_dirs) > 0
+            has_peft_adapter = (checkpoint_path / "adapter_model.safetensors").exists()
+            
+            log_with_rank(f"📦 Checkpoint type detection:")
+            log_with_rank(f"   DeepSpeed state: {'✅ Found' if has_deepspeed_state else '❌ Missing'}")
+            log_with_rank(f"   PEFT adapter: {'✅ Found' if has_peft_adapter else '❌ Missing'}")
+            
+            if has_peft_adapter and not has_deepspeed_state:
+                # PEFT-only checkpoint: Load adapter manually after trainer creation
+                log_with_rank(f"⚠️  PEFT-only checkpoint detected (no DeepSpeed optimizer state)")
+                log_with_rank(f"   Will load PEFT adapter manually after trainer initialization")
+                peft_checkpoint_path = checkpoint_path
+                # Clear resume_from_checkpoint to prevent DeepSpeed validation error
+                # We'll manually restore the state after trainer creation
+                training_args.resume_from_checkpoint = None
+            
+            # Add config.json if missing (for TRL validation)
+            config_path = checkpoint_path / "config.json"
+            if not config_path.exists():
+                log_with_rank(f"⚙️  Adding missing config.json to checkpoint...")
+                from transformers import AutoConfig
+                config = AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
+                config.save_pretrained(str(checkpoint_path))
+                log_with_rank(f"   ✅ config.json added")
+            
+            # Read trainer state for curriculum learning and max_steps override
+            trainer_state_path = checkpoint_path / "trainer_state.json"
+            if trainer_state_path.exists():
+                with open(trainer_state_path, 'r') as f:
+                    trainer_state = json.load(f)
+                    resumed_step = trainer_state.get("global_step", 0)
+                    original_max_steps = trainer_state.get("max_steps", None)
+                
+                log_with_rank(f"📂 Checkpoint info:")
+                log_with_rank(f"   Path: {checkpoint_path}")
+                log_with_rank(f"   Resumed step: {resumed_step}")
+                log_with_rank(f"   Original max_steps: {original_max_steps}")
+                
+                # Calculate target max_steps (where training should end)
+                if img_args.override_max_steps is not None:
+                    # User explicitly overrides the target
+                    target_max_steps = img_args.override_max_steps
+                    log_with_rank(f"   Target max_steps: {target_max_steps} (user override)")
+                else:
+                    # Default: continue to original max_steps
+                    target_max_steps = original_max_steps if original_max_steps is not None else training_args.max_steps
+                    log_with_rank(f"   Target max_steps: {target_max_steps} (original)")
+                
+                # Keep max_steps as target (needed for curriculum calculation)
+                # We'll set the trainer's initial step after trainer creation
+                training_args.max_steps = target_max_steps
+                
+                # Calculate remaining steps for logging
+                remaining_steps = max(0, target_max_steps - resumed_step)
+                log_with_rank(f"   Will train from step {resumed_step} to {target_max_steps} ({remaining_steps} remaining steps)")
+    
     # Load dataset
+    # IMPORTANT: Using full dataset (~17k samples) for optimal curriculum learning
+    # With 59 tuples and 5 difficulty groups, this gives ~290 samples per tuple
+    # No technical bottleneck - better diversity and more robust curriculum progression
     train_ds, eval_ds = prepare_dataset(
         img_args.levels,
         img_args.disciplines,
-        max_samples=1000,
+        max_samples=None,  # Use all samples for best curriculum coverage
         local_data_path=img_args.local_data_path,
+        stratify_by_difficulty=False,  # Set to True if you want guaranteed proportional sampling
+        difficulty_summary_path=img_args.difficulty_summary_path if img_args.num_diff_lvls > 1 else None,
     )
     
     # Calculate max_steps if not set
@@ -2321,6 +2931,17 @@ if __name__ == "__main__":
                 difficulty_groups=difficulty_groups,
                 max_steps=training_args.max_steps
             )
+            
+            # Restore curriculum state when resuming from checkpoint
+            # IMPORTANT: Use resumed_step instead of training_args.resume_from_checkpoint
+            # because we may have cleared resume_from_checkpoint for PEFT-only checkpoints
+            # Note: The trainer's global_step will be set to resumed_step, so curriculum
+            # will automatically continue from the correct position via the callback
+            if resumed_step > 0:
+                log_with_rank(f"📚 Initializing curriculum at step {resumed_step}")
+                curriculum_dataset.update_difficulty(resumed_step)
+                log_with_rank(f"   Curriculum level: {curriculum_dataset.current_difficulty_level + 1}/{curriculum_dataset.num_groups}")
+                log_with_rank(f"   Available samples: {len(curriculum_dataset.current_indices)}/{len(curriculum_dataset.full_dataset)}")
             
             # Use the curriculum dataset wrapper directly for training
             # It will dynamically filter samples based on training progress
@@ -2393,6 +3014,101 @@ if __name__ == "__main__":
         peft_config=get_peft_config(model_args),
     )
     
+    # Load PEFT adapter manually if resuming from PEFT-only checkpoint
+    if peft_checkpoint_path is not None:
+        log_with_rank(f"🔄 Loading PEFT adapter from {peft_checkpoint_path}")
+        try:
+            # The model is already a PeftModel from GRPOTrainer initialization
+            # We need to load the adapter weights into it
+            from safetensors.torch import load_file
+            import torch
+            
+            # Load the adapter weights
+            adapter_weights_path = peft_checkpoint_path / "adapter_model.safetensors"
+            if adapter_weights_path.exists():
+                adapter_weights = load_file(str(adapter_weights_path))
+                
+                # Load weights into the model
+                # The model is already wrapped with PEFT, so we can load directly
+                trainer.model.load_state_dict(adapter_weights, strict=False)
+                log_with_rank(f"   ✅ PEFT adapter weights loaded successfully")
+            else:
+                log_with_rank(f"   ❌ adapter_model.safetensors not found", level="error")
+                raise FileNotFoundError(f"Adapter weights not found at {adapter_weights_path}")
+            
+            # CRITICAL: Load full trainer state from checkpoint to properly initialize step counter
+            # This ensures:
+            # 1. Checkpoints save with correct names (checkpoint-200, not checkpoint-50)
+            # 2. Curriculum calculates progress correctly (200/500, not 50/500)
+            # 3. Training stops at correct step (500, not 650)
+            # 4. Progress bar shows correct steps (150/500, not 0/500)
+            if resumed_step > 0:
+                log_with_rank(f"   🔧 Loading trainer state from checkpoint:")
+                
+                # Load the full trainer state from checkpoint
+                from transformers import TrainerState
+                trainer_state_file = peft_checkpoint_path / "trainer_state.json"
+                
+                if trainer_state_file.exists():
+                    loaded_state = TrainerState.load_from_json(str(trainer_state_file))
+                    
+                    # Copy critical state fields to trainer
+                    trainer.state.global_step = loaded_state.global_step
+                    trainer.state.epoch = loaded_state.epoch
+                    trainer.state.max_steps = training_args.max_steps  # Use our potentially overridden max_steps
+                    trainer.state.total_flos = loaded_state.total_flos
+                    trainer.state.log_history = loaded_state.log_history
+                    trainer.state.best_metric = loaded_state.best_metric
+                    trainer.state.best_model_checkpoint = loaded_state.best_model_checkpoint
+                    trainer.state.is_local_process_zero = loaded_state.is_local_process_zero
+                    trainer.state.is_world_process_zero = loaded_state.is_world_process_zero
+                    
+                    log_with_rank(f"   ✅ Trainer state loaded from checkpoint:")
+                    log_with_rank(f"      - global_step: {trainer.state.global_step}")
+                    log_with_rank(f"      - max_steps: {trainer.state.max_steps}")
+                    log_with_rank(f"      - Steps to train: {trainer.state.max_steps - trainer.state.global_step}")
+                else:
+                    log_with_rank(f"   ⚠️  trainer_state.json not found, manually setting state")
+                    trainer.state.global_step = resumed_step
+                    trainer.state.epoch = 0
+                    trainer.state.max_steps = training_args.max_steps
+            
+            log_with_rank(f"   ℹ️  Training will continue from step {resumed_step} to {training_args.max_steps}")
+            log_with_rank(f"   ⚠️  Note: Optimizer/scheduler reset to initial state (DeepSpeed state missing)")
+        except Exception as e:
+            log_with_rank(f"   ❌ Failed to load PEFT adapter: {e}", level="error")
+            raise
+    
+    # Add callback to preserve manually-set state for PEFT-only checkpoint resume
+    if peft_checkpoint_path is not None and resumed_step > 0:
+        from transformers import TrainerCallback
+        
+        class StatePreservationCallback(TrainerCallback):
+            """Preserve manually-set trainer state when resuming from PEFT-only checkpoint"""
+            
+            def __init__(self, target_global_step, target_max_steps):
+                self.target_global_step = target_global_step
+                self.target_max_steps = target_max_steps
+                self.state_restored = False
+            
+            def on_train_begin(self, args, state, control, **kwargs):
+                """Restore state at the very beginning of training"""
+                if not self.state_restored:
+                    log_with_rank(f"🔧 StatePreservationCallback: Restoring state at train begin")
+                    log_with_rank(f"   Before: global_step={state.global_step}, max_steps={state.max_steps}")
+                    state.global_step = self.target_global_step
+                    state.max_steps = self.target_max_steps
+                    log_with_rank(f"   After: global_step={state.global_step}, max_steps={state.max_steps}")
+                    self.state_restored = True
+                return control
+        
+        preservation_callback = StatePreservationCallback(
+            target_global_step=resumed_step,
+            target_max_steps=training_args.max_steps
+        )
+        trainer.add_callback(preservation_callback)
+        log_with_rank(f"✅ State preservation callback added for resumed training")
+    
     # Inject model and trainer into reward function
     set_vlm_model(trainer.model)
     set_trainer(trainer)
@@ -2422,6 +3138,7 @@ if __name__ == "__main__":
             
             def on_step_end(self, args, state, control, **kwargs):
                 """Update curriculum after each step"""
+                # Use state.global_step directly (it's properly initialized when resuming)
                 current_step = state.global_step
                 
                 # Update curriculum (this will only trigger changes at difficulty boundaries)
@@ -2447,258 +3164,30 @@ if __name__ == "__main__":
         trainer.add_callback(callback)
         log_with_rank("✅ Curriculum callback registered")
     
-    # Register image logging callback for wandb (avoids deadlock by calling gather_object in synchronized on_step_end)
-    if img_args.wandb_log_images > 0:
-        from transformers import TrainerCallback
-        from pathlib import Path
-        
-        class ImageLoggingCallback(TrainerCallback):
-            """
-            Callback to log generated images to wandb in distributed training.
-            
-            Gathers data from all ranks in on_step_end() where ranks are synchronized,
-            avoiding deadlock from calling gather_object() during reward computation.
-            """
-            
-            def __init__(self, wandb_log_images, wandb_image_size, logging_steps):
-                self.wandb_log_images = wandb_log_images
-                self.wandb_image_size = wandb_image_size
-                self.logging_steps = logging_steps
-                self.pending_data = {}  # step -> rank_data mapping
-            
-            def store_data_for_step(self, step, rank_data):
-                """Called by reward function to store data for later logging"""
-                self.pending_data[step] = rank_data
-            
-            def on_step_end(self, args, state, control, **kwargs):
-                """
-                Called after each training step when all ranks are synchronized.
-                This is where we safely call gather_object().
-                """
-                import torch.distributed as dist
-                
-                current_step = state.global_step
-                
-                # Only log every N steps - all ranks check same condition
-                if current_step % self.logging_steps != 0:
-                    return control
-                
-                log_with_rank(f"🔍 CALLBACK on_step_end called")
-                log_with_rank(f"   Trainer global_step: {current_step}")
-                log_with_rank(f"   Will check keys: {[current_step-1, current_step, current_step+1]}")
-                log_with_rank(f"   Available in pending_data: {sorted(self.pending_data.keys())}")
-                
-                # Prepare data for this rank (wrap in list for gather_object)
-                # gather_object expects iterables, so use [rank_data] or []
-                # Note: Check all possible step keys since image_log_step might differ from global_step
-                rank_data = []
-                for step_key in [current_step, current_step - 1, current_step + 1]:
-                    if step_key in self.pending_data:
-                        rank_data = [self.pending_data.pop(step_key)]
-                        log_with_rank(f"✅ FOUND data for step_key={step_key}")
-                        break
-                
-                if not rank_data:
-                    log_with_rank(f"❌ NO DATA FOUND!")
-                    log_with_rank(f"   Searched for: {[current_step-1, current_step, current_step+1]}")
-                    log_with_rank(f"   Available keys: {sorted(self.pending_data.keys())}")
-                    log_with_rank(f"   ⚠️ This will cause 'No valid samples' warning!")
-                else:
-                    log_with_rank(f"   Retrieved {len(rank_data[0]['sampled_data']) if rank_data and len(rank_data) > 0 and 'sampled_data' in rank_data[0] else 0} samples", verbose_only=True)
-                
-                # CRITICAL: Barrier to ensure all ranks reach this point before gather
-                # This prevents deadlock where some ranks call gather_object before others enter callback
-                if dist.is_initialized():
-                    log_with_rank(f"Waiting at barrier before gather (step {current_step})...", verbose_only=True)
-                    dist.barrier()
-                    log_with_rank(f"Barrier cleared, proceeding to gather (step {current_step})...", verbose_only=True)
-                
-                # CRITICAL: All ranks participate in gather (synchronized by barrier above)
-                # Ranks without data pass empty list []
-                log_with_rank(f"Gathering image data from all ranks via gather_object (step {current_step})...", verbose_only=True)
-                all_ranks_data_nested = gather_object(rank_data)
-                log_with_rank(f"Successfully gathered {len(all_ranks_data_nested)} items from all ranks", verbose_only=True)
-                
-                # gather_object returns dicts directly (not wrapped in lists!)
-                # Structure: [dict, dict, None, None] where each dict is {'rank': X, 'sampled_data': [...], ...}
-                all_ranks_data = all_ranks_data_nested  # No flattening needed!
-                
-                # DEBUG: Validate structure and count valid items
-                valid_count = 0
-                for i, item in enumerate(all_ranks_data):
-                    if item is not None and isinstance(item, dict) and 'sampled_data' in item:
-                        n_samples = len(item.get('sampled_data', []))
-                        valid_count += 1
-                        log_with_rank(f"  Rank {i}: {n_samples} samples", verbose_only=True)
-                    else:
-                        log_with_rank(f"  Rank {i}: None or invalid", verbose_only=True)
-                
-                log_with_rank(f"✅ Gathered data from {valid_count}/{len(all_ranks_data)} ranks")
-                
-                # Only rank 0 logs to wandb
-                rank = get_rank()
-                if rank == 0:
-                    self._log_to_wandb(all_ranks_data, current_step)
-                else:
-                    log_with_rank("Gather complete, continuing training (non-rank-0)", verbose_only=True)
-                
-                return control
-            
-            def _log_to_wandb(self, all_ranks_data, step):
-                """Rank 0 only: Process gathered data and log to wandb"""
-                try:
-                    import wandb
-                    from PIL import Image as PILImage
-                    
-                    if wandb.run is None:
-                        log_with_rank("wandb.run is None, skipping", level="warning", verbose_only=True)
-                        return
-                    
-                    # Define custom step metric for image logging
-                    try:
-                        wandb.define_metric("reward_step")
-                        wandb.define_metric("rank*/generation_table", step_metric="reward_step")
-                        wandb.define_metric("rank*/avg_*", step_metric="reward_step")
-                        wandb.define_metric("rank*/reward_*", step_metric="reward_step")
-                        wandb.define_metric("rank*/num_*", step_metric="reward_step")
-                    except Exception:
-                        pass
-                    
-                    log_with_rank("Processing gathered data from all ranks...", verbose_only=True)
-                    
-                    # Filter valid data
-                    valid_ranks_data = []
-                    for i, data in enumerate(all_ranks_data):
-                        # Skip None and invalid data
-                        if data is None:
-                            log_with_rank(f"Item {i} is None", verbose_only=True)
-                        elif isinstance(data, dict) and data.get("sampled_data") and len(data["sampled_data"]) > 0:
-                            valid_ranks_data.append(data)
-                            log_with_rank(f"Item {i} has {len(data['sampled_data'])} samples", verbose_only=True)
-                        else:
-                            log_with_rank(f"Item {i} has no valid samples", verbose_only=True)
-                    
-                    # Guard: Check if we have any valid data from any rank
-                    if len(valid_ranks_data) == 0:
-                        log_with_rank("No valid samples from any rank, skipping wandb logging", level="warning")
-                        return
-                    
-                    # Create compact wandb table with SAMPLED images
-                    log_with_rank(f"Creating wandb tables for sampled images from {len(valid_ranks_data)} ranks...", verbose_only=True)
-                    
-                    # Comprehensive columns including prompts, completions, and graphs
-                    columns = [
-                        "rank", "idx", "image", "gt_image", 
-                        "prompt", "completion",
-                        "level", "discipline",
-                        "KF", "regions", "R_score", "reward", "advantage",
-                        "gt_graph", "pred_graph"
-                    ]
-                    
-                    table_data = []
-                    for rank_data_item in valid_ranks_data:
-                        r = rank_data_item["rank"]
-                        for sample in rank_data_item["sampled_data"]:
-                            # Convert to wandb.Image (already resized and compressed)
-                            wandb_img = wandb.Image(sample["image"])
-                            if sample["gt_image"] is not None:
-                                wandb_gt_img = wandb.Image(sample["gt_image"])
-                            else:
-                                blank = PILImage.new('RGB', (50, 50), color='gray')
-                                wandb_gt_img = wandb.Image(blank, caption="No GT")
-                            
-                            table_data.append([
-                                r,
-                                sample["idx"],
-                                wandb_img,
-                                wandb_gt_img,
-                                sample["prompt"],
-                                sample["completion"],
-                                sample["level"],
-                                sample["discipline"],
-                                sample["knowledge_fidelity"],
-                                sample["region_count"],
-                                sample["R_score"],
-                                sample["reward"],
-                                sample["advantage"],
-                                sample["gt_graph"],
-                                sample["pred_graph"],
-                            ])
-                    
-                    # Single combined table for all ranks
-                    log_with_rank(f"Creating wandb table with {len(table_data)} rows...", verbose_only=True)
-                    table = wandb.Table(columns=columns, data=table_data)
-                    
-                    # Prepare log dict
-                    log_dict = {"reward_step": step}
-                    log_dict["generation_samples"] = table
-                    log_with_rank(f"Prepared log_dict with {len(log_dict)} keys", verbose_only=True)
-                    
-                    # Log summary stats and reward distributions for each rank
-                    for rank_data_item in valid_ranks_data:
-                        r = rank_data_item["rank"]
-                        stats = rank_data_item["summary_stats"]
-                        log_dict[f"rank{r}/num_total"] = stats["num_total"]
-                        log_dict[f"rank{r}/num_sampled"] = stats["num_sampled"]
-                        log_dict[f"rank{r}/avg_reward"] = stats["avg_reward"]
-                        log_dict[f"rank{r}/avg_kf"] = stats["avg_knowledge_fidelity"]
-                        log_dict[f"rank{r}/avg_regions"] = stats["avg_region_count"]
-                        log_dict[f"rank{r}/avg_R_score"] = stats["avg_R_score"]
-                        log_dict[f"rank{r}/reward_std"] = stats["reward_std"]
-                        
-                        # Create distribution histograms for key metrics for this rank
-                        rank_rewards = [sample["reward"] for sample in rank_data_item["sampled_data"]]
-                        rank_kfs = [sample["knowledge_fidelity"] for sample in rank_data_item["sampled_data"]]
-                        rank_regions = [sample["region_count"] for sample in rank_data_item["sampled_data"]]
-                        rank_rscores = [sample["R_score"] for sample in rank_data_item["sampled_data"]]
-                        
-                        if len(rank_rewards) > 0:
-                            log_dict[f"rank{r}/reward_distribution"] = wandb.Histogram(rank_rewards)
-                            log_dict[f"rank{r}/kf_distribution"] = wandb.Histogram(rank_kfs)
-                            log_dict[f"rank{r}/regions_distribution"] = wandb.Histogram(rank_regions)
-                            log_dict[f"rank{r}/rscore_distribution"] = wandb.Histogram(rank_rscores)
-                            log_with_rank(f"   Rank {r}: distributions with {len(rank_rewards)} samples", verbose_only=True)
-                    
-                    # Create combined metric distributions across all ranks
-                    all_rewards = []
-                    all_kfs = []
-                    all_regions = []
-                    all_rscores = []
-                    for rank_data_item in valid_ranks_data:
-                        all_rewards.extend([sample["reward"] for sample in rank_data_item["sampled_data"]])
-                        all_kfs.extend([sample["knowledge_fidelity"] for sample in rank_data_item["sampled_data"]])
-                        all_regions.extend([sample["region_count"] for sample in rank_data_item["sampled_data"]])
-                        all_rscores.extend([sample["R_score"] for sample in rank_data_item["sampled_data"]])
-                    
-                    if len(all_rewards) > 0:
-                        log_dict["all_ranks/reward_distribution"] = wandb.Histogram(all_rewards)
-                        log_dict["all_ranks/kf_distribution"] = wandb.Histogram(all_kfs)
-                        log_dict["all_ranks/regions_distribution"] = wandb.Histogram(all_regions)
-                        log_dict["all_ranks/rscore_distribution"] = wandb.Histogram(all_rscores)
-                        log_with_rank(f"   Combined distributions with {len(all_rewards)} total samples", verbose_only=True)
-                    
-                    # Single log call for all data
-                    wandb.log(log_dict, commit=True)
-                    log_with_rank(f"✅ Successfully logged {len(table_data)} samples to wandb table 'generation_samples' at step {step}")
-                    log_with_rank(f"   Logged data from {len(valid_ranks_data)} ranks", verbose_only=True)
-                
-                except Exception as e:
-                    log_with_rank(f"Failed to log to wandb: {e}", level="error")
-                    import traceback
-                    traceback.print_exc()
-        
-        image_callback = ImageLoggingCallback(
-            wandb_log_images=img_args.wandb_log_images,
-            wandb_image_size=img_args.wandb_image_size,
-            logging_steps=training_args.logging_steps
-        )
-        trainer.add_callback(image_callback)
-        trainer.image_logging_callback = image_callback  # Store reference for reward function
-        log_with_rank("✅ Image logging callback registered")
+    # Note: Image logging now happens inline during reward computation (no callback needed)
+    # All ranks participate in gather_object() synchronously within the reward function
+    # This eliminates barrier deadlocks and step mismatch issues
+    log_with_rank("✅ Image logging configured (inline mode, no callback needed)")
     
     # Train
     log_with_rank("Starting training...")
-    trainer.train()
+    log_with_rank(f"Trainer state before training:")
+    log_with_rank(f"   global_step: {trainer.state.global_step}")
+    log_with_rank(f"   max_steps: {trainer.state.max_steps}")
+    
+    # Pass resume_from_checkpoint explicitly to trainer.train()
+    # Note: For PEFT-only checkpoints, we've already loaded the adapter and set the state manually
+    if training_args.resume_from_checkpoint:
+        # Full checkpoint resume (has DeepSpeed state)
+        trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+    elif resumed_step > 0:
+        # PEFT-only checkpoint: we manually loaded weights and state
+        # Don't pass resume_from_checkpoint (it's None), but the state is already set
+        log_with_rank(f"Resuming training with manually loaded PEFT checkpoint (step {resumed_step})")
+        trainer.train()
+    else:
+        # Fresh training
+        trainer.train()
     
     # Save
     log_with_rank("Saving model...")

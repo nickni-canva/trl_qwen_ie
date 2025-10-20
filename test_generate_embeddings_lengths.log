@@ -1,0 +1,63 @@
+/home/coder/miniconda3/envs/diffusers/lib/python3.11/site-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+INFO 10-18 15:14:55 [__init__.py:216] Automatically detected platform cuda.
+The image processor of type `Qwen2VLImageProcessor` is now loaded as a fast processor by default, even if the model checkpoint was saved with a slow processor. This is a breaking change and may produce slightly different outputs. To continue using the slow processor, instantiate this class with `use_fast=False`. Note that this behavior will be extended to all models in a future release.
+`torch_dtype` is deprecated! Use `dtype` instead!
+====================================================================================================
+TEST SUITE: generate_with_embeddings with Various Token Lengths
+====================================================================================================
+
+====================================================================================================
+SETUP: Initializing Models
+====================================================================================================
+
+1. Loading VLM model: Qwen/Qwen2.5-VL-7B-Instruct
+Loading checkpoint shards:   0%|          | 0/5 [00:00<?, ?it/s]Loading checkpoint shards:  20%|██        | 1/5 [00:00<00:03,  1.14it/s]Loading checkpoint shards:  40%|████      | 2/5 [00:01<00:02,  1.23it/s]Loading checkpoint shards:  60%|██████    | 3/5 [00:02<00:01,  1.25it/s]Loading checkpoint shards:  80%|████████  | 4/5 [00:03<00:00,  1.27it/s]Loading checkpoint shards: 100%|██████████| 5/5 [00:03<00:00,  1.72it/s]Loading checkpoint shards: 100%|██████████| 5/5 [00:03<00:00,  1.46it/s]
+✅ VLM model loaded on device: cuda:0
+
+2. Loading Diffusion Pipeline: Qwen/Qwen-Image
+Loading pipeline components...:   0%|          | 0/5 [00:00<?, ?it/s]Loading pipeline components...:  40%|████      | 2/5 [00:00<00:00, 12.07it/s]
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s][ALoading checkpoint shards: 100%|██████████| 4/4 [00:00<00:00, 48.31it/s]
+Loading pipeline components...:  80%|████████  | 4/5 [00:00<00:00, 13.69it/s]The config attributes {'pooled_projection_dim': 768} were passed to QwenImageTransformer2DModel, but are not expected and will be ignored. Please verify your config.json configuration file.
+
+Loading checkpoint shards:   0%|          | 0/9 [00:00<?, ?it/s][A
+Loading checkpoint shards:  89%|████████▉ | 8/9 [00:00<00:00, 70.56it/s][ALoading checkpoint shards: 100%|██████████| 9/9 [00:00<00:00, 74.85it/s]
+Loading pipeline components...: 100%|██████████| 5/5 [00:00<00:00, 10.25it/s]
+/home/coder/work/customized_diffusers/src/diffusers/pipelines/qwenimage/pipeline_qwenimage_response.py:372: FutureWarning: `enable_vae_slicing` is deprecated and will be removed in version 0.40.0. Calling `enable_vae_slicing()` on a `QwenImageResponsePipeline` is deprecated and this method will be removed in a future version. Please use `pipe.vae.enable_slicing()`.
+  deprecate(
+ negative_prompt is passed but classifier-free guidance is not enabled since true_cfg_scale <= 1
+   Loading LoRA weights...
+   Replacing text_encoder with VLM model...
+✅ Pipeline loaded on device: cuda
+✅ Setup complete!
+
+
+====================================================================================================
+TEST CASE 5: Exact 489 Tokens (Original Error Trigger)
+====================================================================================================
+NOTE: The original error was 'Size mismatch (512 vs 489)'
+      This test specifically targets ~489 tokens to verify the fix.
+
+⚠️  Target: ~489 tokens
+   Actual: 401 tokens
+   Note: Adjusting to hit exact target may require calibration
+
+====================================================================================================
+TEST: Exact 489 Tokens (Original Error Trigger)
+====================================================================================================
+
+Test Configuration:
+  Number of samples: 16
+  Token counts: [401, 401, 401, 401, 401, 401, 401, 401, 401, 401, 401, 401, 401, 401, 401, 401]
+  Min tokens: 401
+  Max tokens: 401
+  Mean tokens: 401.0
+
+Step 1: Extracting response embeddings...
+  Embeddings shape: torch.Size([16, 347, 3584])
+  Masks shape: torch.Size([16, 347])
+  Active token counts (from masks): [346, 346, 346, 346, 346, 346, 346, 346, 346, 347, 347, 347, 347, 347, 347, 347]
+  ✅ Embeddings extracted successfully
+
+Step 2: Generating images with embeddings...
+  0%|          | 0/8 [00:00<?, ?it/s] 12%|█▎        | 1/8 [00:03<00:25,  3.57s/it] 25%|██▌       | 2/8 [00:06<00:20,  3.35s/it] 38%|███▊      | 3/8 [00:10<00:16,  3.37s/it]
